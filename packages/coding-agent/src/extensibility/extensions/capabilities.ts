@@ -14,6 +14,8 @@
  * Gating only the first would leave the same hole one object over.
  */
 
+import type { EventBus } from "../../utils/event-bus";
+
 export type ExtensionCapabilityKind =
 	| "process:exec"
 	| "events:subscribe"
@@ -258,11 +260,7 @@ const REFUSAL_COERCION_KEYS: Record<string, true> = { then: true, toJSON: true }
  * the extension path, the member, the property and the kind in the message at
  * the call site, which is the whole reason the member is gated.
  */
-function makeRefusedMember(
-	extensionPath: string,
-	member: string,
-	capability: ExtensionCapabilityKind,
-): unknown {
+function makeRefusedMember(extensionPath: string, member: string, capability: ExtensionCapabilityKind): unknown {
 	const refuse = (): never => {
 		throw new ExtensionCapabilityDenied(extensionPath, member, capability);
 	};
@@ -322,6 +320,28 @@ export interface ExecGrantCheck {
 }
 
 /**
+ * The bus an extension that declared `events:subscribe` and not `events:emit`
+ * receives: `on` reaches the real bus, everything else is refused by name.
+ *
+ * `pi.events` is the one gated member whose reach splits across two
+ * capabilities, because listening and publishing are different powers.
+ * Publishing is the strictly larger one — a publisher can already drive every
+ * subscriber on the bus — so a declared `events:emit` keeps the whole bus and
+ * the narrow grant exists for the extension that only listens. Without it,
+ * subscribing to a channel costs the power to publish on any channel.
+ */
+function narrowEventBus(bus: EventBus, extensionPath: string): EventBus {
+	return new Proxy(bus, {
+		get(target, property) {
+			if (property === "on") {
+				return target.on.bind(target);
+			}
+			throw new ExtensionCapabilityDenied(extensionPath, `events.${String(property)}`, "events:emit");
+		},
+	});
+}
+
+/**
  * Replace every member of `target` whose capability was not granted with a
  * stand-in that refuses and names the missing grant.
  *
@@ -350,6 +370,14 @@ export function applyCapabilityGate(
 		const parameterised = capability === "process:exec";
 		const granted = grants.kinds.has(capability);
 		if (parameterised ? granted && !execCheck : granted) continue;
+		if (capability === "events:emit" && grants.kinds.has("events:subscribe")) {
+			Object.defineProperty(target, member, {
+				value: narrowEventBus(value as EventBus, extensionPath),
+				writable: false,
+				configurable: true,
+			});
+			continue;
+		}
 		Object.defineProperty(target, member, {
 			value: makeDeniedMember(extensionPath, member, capability, value, execCheck),
 			writable: false,

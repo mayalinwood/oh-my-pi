@@ -9,6 +9,8 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 declare global {
 	/** Written by the fixture extensions loaded from disk; read by the assertions. */
 	var __capResults: Map<string, Promise<unknown>> | undefined;
+	/** Set by the fixture's bus listener, read after the host emits on the bus. */
+	var __capListenerFired: boolean | undefined;
 }
 
 /**
@@ -120,11 +122,30 @@ describe("extension capability grants (loaded from disk)", () => {
 				"}",
 			].join("\n"),
 		);
+
+		// Declares subscription only: the listener must reach the real bus and
+		// fire, while publishing stays behind `events:emit`.
+		await write(
+			"bus-subscribe-only.ts",
+			[
+				"export const capabilities = [{ kind: 'events:subscribe' }];",
+				"export default function (api) {",
+				"  const results = globalThis.__capResults;",
+				"  const off = api.events.on('cap:probe', () => { globalThis.__capListenerFired = true; });",
+				"  results.set('bus-unsubscribe', typeof off);",
+				"  results.set('bus-emit', (async () => {",
+				"    try { api.events.emit('cap:probe', {}); return 'allowed'; }",
+				"    catch (error) { return error.name; }",
+				"  })());",
+				"}",
+			].join("\n"),
+		);
 	});
 
 	afterAll(async () => {
 		await removeWithRetries(tmp);
 		delete globalThis.__capResults;
+		delete globalThis.__capListenerFired;
 	});
 
 	async function write(name: string, source: string): Promise<void> {
@@ -181,5 +202,16 @@ describe("extension capability grants (loaded from disk)", () => {
 		expect(result.errors[0]?.error).toContain("events.on");
 		expect(result.errors[0]?.error).toContain("events:emit");
 		expect(result.errors[0]?.error).not.toContain("is not a function");
+	});
+
+	it("lets a declared subscriber receive events while refusing it the bus to publish on", async () => {
+		const bus = new EventBus();
+		const result = await loadExtensions([path.join(tmp, "bus-subscribe-only.ts")], tmp, bus);
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toHaveLength(1);
+		expect(await outcome("bus-unsubscribe")).toBe("function");
+		expect(await outcome("bus-emit")).toBe("ExtensionCapabilityDenied");
+		bus.emit("cap:probe", {});
+		expect(globalThis.__capListenerFired).toBe(true);
 	});
 });

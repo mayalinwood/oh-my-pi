@@ -162,6 +162,13 @@ export default function (pi: ExtensionAPI) {
   refuses when a property of it is reached for, and the message then names the
   property too (`used "events.on"`). Reading such a stand-in never yields the real
   object, and calling, constructing or writing to it is refused the same way.
+- `pi.events` is the one member whose reach **splits**: `on` is `events:subscribe`,
+  `emit` and `clear` are `events:emit`. Publishing is the strictly larger power — a
+  publisher can already drive every subscriber on the bus — so a declared
+  `events:emit` keeps the whole bus, and `events:subscribe` alone narrows the member
+  to `on`. An extension that only listens therefore does not have to declare the
+  power to publish on any channel, and one that does declare `events:emit` reaches
+  the same bus object it did before.
 
 - Grants bound *what an extension may reach*, not what a granted reach may do once inside
   the process. Extensions are **not sandboxed** — see
@@ -186,7 +193,7 @@ privileged: `pi.zod`, `pi.arktype`, `pi.typebox`, `pi.pi`, `pi.logger`, `ctx.ui`
 | Member                                                                   | Kind                   |
 | ------------------------------------------------------------------------ | ---------------------- |
 | `on`                                                                     | `events:subscribe`     |
-| `events`                                                                 | `events:emit`          |
+| `events`                                                                 | `events:emit`, or `events:subscribe` for `on` alone |
 | `registerTool`                                                           | `tools:register`       |
 | `registerFileWriteFallback`                                              | `fs:write`             |
 | `registerFileDeleteFallback`                                             | `fs:delete`            |

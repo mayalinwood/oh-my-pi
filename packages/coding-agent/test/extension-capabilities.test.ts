@@ -78,7 +78,7 @@ describe("applyCapabilityGate", () => {
 			exec: (command: string) => `ran ${command}`,
 			sendMessage: () => "sent",
 			getSessionName: () => "session-1",
-			logger: { info: () => { } },
+			logger: { info: () => {} },
 		};
 	}
 
@@ -223,5 +223,58 @@ describe("applyCapabilityGate", () => {
 			ctx["modelRegistry"] = { models: ["sneaked"] };
 		}).toThrow();
 		expect(() => (ctx.modelRegistry as Record<string, unknown>).models).toThrow(ExtensionCapabilityDenied);
+	});
+});
+
+describe("the event bus member", () => {
+	const makeBus = () => ({ on: () => "subscribed", emit: () => "emitted" });
+	type BusView = { on: () => string; emit: () => string };
+
+	it("keeps the whole bus for an extension that declared it publishes", () => {
+		const bus = makeBus();
+		const api: Record<string, unknown> = { events: bus };
+		applyCapabilityGate(
+			api,
+			EXTENSION_MEMBER_CAPABILITIES,
+			resolveExtensionGrants([{ kind: "events:emit" }]),
+			"/ext/a.ts",
+		);
+		expect(api.events).toBe(bus);
+		const view = api.events as BusView;
+		expect(view.on()).toBe("subscribed");
+		expect(view.emit()).toBe("emitted");
+	});
+
+	it("narrows the bus to `on` for an extension that declared only subscription", () => {
+		const bus = makeBus();
+		const api: Record<string, unknown> = { events: bus };
+		applyCapabilityGate(
+			api,
+			EXTENSION_MEMBER_CAPABILITIES,
+			resolveExtensionGrants([{ kind: "events:subscribe" }]),
+			"/ext/a.ts",
+		);
+		expect((api.events as BusView).on()).toBe("subscribed");
+		try {
+			(api.events as BusView).emit();
+			throw new Error("expected a refusal");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ExtensionCapabilityDenied);
+			expect((error as Error).message).toContain("events.emit");
+			expect((error as Error).message).toContain("events:emit");
+		}
+	});
+
+	it("refuses the bus entirely when neither capability was declared", () => {
+		const api: Record<string, unknown> = { events: makeBus() };
+		applyCapabilityGate(api, EXTENSION_MEMBER_CAPABILITIES, resolveExtensionGrants([]), "/ext/a.ts");
+		try {
+			(api.events as BusView).on();
+			throw new Error("expected a refusal");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ExtensionCapabilityDenied);
+			expect((error as Error).message).toContain("events.on");
+			expect((error as Error).message).toContain("events:emit");
+		}
 	});
 });
