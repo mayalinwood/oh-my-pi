@@ -23,13 +23,40 @@ describe("resolveExtensionGrants", () => {
 		expect(grants.exec).toEqual([{ command: "git", args: ["rev-parse"] }]);
 	});
 
-	it("drops a malformed exec grant instead of widening access", () => {
+	it("drops a malformed exec grant instead of widening access, and says why", () => {
 		const grants = resolveExtensionGrants([
 			{ kind: "process:exec", command: "", args: ["**"] },
 			{ kind: "process:exec", command: "bash" },
 			{ kind: "process:exec", command: "sh", args: ["**", 7] },
 		]);
 		expect(grants.exec).toEqual([]);
+		// Without the reason, the extension meets a refusal telling it to declare
+		// a capability it already declared, and no edit can follow that advice.
+		expect(grants.malformed).toEqual([
+			'entry #0: "process:exec" needs a non-empty "command" string',
+			'entry #1: "process:exec" needs "args" to be an array of strings',
+			'entry #2: "process:exec" needs "args" to be an array of strings',
+		]);
+		expect(grants.kinds.has("process:exec")).toBe(false);
+	});
+
+	it("names the position of a declaration entry that is not one", () => {
+		const grants = resolveExtensionGrants(["events:read", { name: "tools:register" }, { kind: 7 }]);
+		expect(grants.malformed).toEqual([
+			"entry #0 is not a capability object",
+			'entry #1 has no string "kind"',
+			'entry #2 has no string "kind"',
+		]);
+		expect(grants.kinds.size).toBe(0);
+	});
+
+	it("holds a well-formed declaration free of reasons", () => {
+		const grants = resolveExtensionGrants([
+			{ kind: "events:subscribe" },
+			{ kind: "process:exec", command: "git", args: ["rev-parse"] },
+		]);
+		expect(grants.malformed).toEqual([]);
+		expect(grants.unknown).toEqual([]);
 	});
 
 	it("reports a capability kind the runtime does not know", () => {

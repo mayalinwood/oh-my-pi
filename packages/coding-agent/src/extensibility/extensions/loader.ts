@@ -595,6 +595,12 @@ async function bindExtension(
 				error: `Extension declares capabilities this runtime does not implement: ${grants.unknown.join(", ")}: ${extensionPath}`,
 			};
 		}
+		if (grants.malformed.length > 0) {
+			return {
+				extension: null,
+				error: `Extension declares capabilities it cannot use: ${grants.malformed.join("; ")}: ${extensionPath}`,
+			};
+		}
 		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus, settingsInstance, grants);
 		await withHostGuard(() => runExtensionFactory(factory, api, runtime));
 

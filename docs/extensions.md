@@ -150,6 +150,14 @@ export default function (pi: ExtensionAPI) {
   gated member; the grant is never inferred from what the factory does.
 - A `kind` this runtime does not implement is **not ignored** — the load fails with
   `Extension declares capabilities this runtime does not implement: <kind>`.
+- A declared entry this runtime cannot turn into a grant is **not ignored** either.
+  An entry that is not an object, one with no string `kind`, and a `process:exec`
+  without a non-empty `command` string or without `args` as an array of strings, all
+  fail the load with `Extension declares capabilities it cannot use: <entry #n: what
+  the shape must be>`, naming the position in the list and the shape required. A
+  refused grant is otherwise unfixable from the outside: the extension already
+  declared it, and the refusal it would meet at the call site asks for exactly the
+  declaration that is present.
 - Calling an undeclared member throws `ExtensionCapabilityDenied`, naming the member and
   the kind it needed. Registration happens while the factory loads, so an undeclared
   `register*` call fails the **load** with that name in its diagnostic

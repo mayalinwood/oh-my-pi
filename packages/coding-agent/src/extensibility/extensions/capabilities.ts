@@ -149,6 +149,8 @@ export interface ResolvedExtensionGrants {
 	exec: ReadonlyArray<{ command: string; args: readonly string[] }>;
 	/** Capability names the declaration used that this runtime does not know. */
 	unknown: readonly string[];
+	/** One reason per declared entry this runtime could not turn into a grant. */
+	malformed: readonly string[];
 }
 
 /**
@@ -193,25 +195,44 @@ function matchesArgs(patterns: readonly string[], args: readonly string[]): bool
  * Malformed entries are dropped rather than trusted: an unparseable grant must
  * never widen access, and an unknown kind is reported so the declaration fails
  * loudly in review rather than quietly doing nothing.
+ *
+ * A dropped entry is reported the same way. Silently dropping one leaves the
+ * extension to meet a refusal that tells it to declare a capability it already
+ * declared, which is advice no edit can follow; naming the shape turns the load
+ * error into the fix.
  */
 export function resolveExtensionGrants(declared: unknown): ResolvedExtensionGrants {
 	const kinds = new Set<ExtensionCapabilityKind>();
 	const exec: Array<{ command: string; args: readonly string[] }> = [];
 	const unknown: string[] = [];
+	const malformed: string[] = [];
 
-	if (!Array.isArray(declared)) return { kinds, exec, unknown };
+	if (!Array.isArray(declared)) return { kinds, exec, unknown, malformed };
 
-	for (const entry of declared) {
-		if (typeof entry !== "object" || entry === null) continue;
+	for (const [index, entry] of declared.entries()) {
+		if (typeof entry !== "object" || entry === null) {
+			malformed.push(`entry #${index} is not a capability object`);
+			continue;
+		}
 		const { kind } = entry as { kind?: unknown };
-		if (typeof kind !== "string" || !ALL_CAPABILITY_KINDS.has(kind)) {
-			if (typeof kind === "string") unknown.push(kind);
+		if (typeof kind !== "string") {
+			malformed.push(`entry #${index} has no string "kind"`);
+			continue;
+		}
+		if (!ALL_CAPABILITY_KINDS.has(kind)) {
+			unknown.push(kind);
 			continue;
 		}
 		if (kind === "process:exec") {
 			const { command, args } = entry as { command?: unknown; args?: unknown };
-			if (typeof command !== "string" || command.length === 0) continue;
-			if (!Array.isArray(args) || args.some(arg => typeof arg !== "string")) continue;
+			if (typeof command !== "string" || command.length === 0) {
+				malformed.push(`entry #${index}: "process:exec" needs a non-empty "command" string`);
+				continue;
+			}
+			if (!Array.isArray(args) || args.some(arg => typeof arg !== "string")) {
+				malformed.push(`entry #${index}: "process:exec" needs "args" to be an array of strings`);
+				continue;
+			}
 			kinds.add(kind);
 			exec.push({ command, args: args as string[] });
 			continue;
@@ -219,7 +240,7 @@ export function resolveExtensionGrants(declared: unknown): ResolvedExtensionGran
 		kinds.add(kind as ExtensionCapabilityKind);
 	}
 
-	return { kinds, exec, unknown };
+	return { kinds, exec, unknown, malformed };
 }
 
 /**
@@ -230,7 +251,12 @@ export function resolveExtensionGrants(declared: unknown): ResolvedExtensionGran
  * entitled to do. Only extensions loaded from a path are gated.
  */
 export function fullExtensionGrants(): ResolvedExtensionGrants {
-	return { kinds: new Set(ALL_CAPABILITY_KINDS) as Set<ExtensionCapabilityKind>, exec: [], unknown: [] };
+	return {
+		kinds: new Set(ALL_CAPABILITY_KINDS) as Set<ExtensionCapabilityKind>,
+		exec: [],
+		unknown: [],
+		malformed: [],
+	};
 }
 
 /** Whether a resolved grant set permits one specific process invocation. */

@@ -110,6 +110,21 @@ describe("extension capability grants (loaded from disk)", () => {
 			].join("\n"),
 		);
 
+		// Declares a process:exec grant it cannot use. The refusal it would meet
+		// asks for the declaration it already wrote, so the load has to name the
+		// shape instead of leaving the author to add power that is not the defect.
+		await write(
+			"malformed-capability.ts",
+			[
+				"export const capabilities = [{ kind: 'process:exec', command: 'git', args: 'rev-parse' }];",
+				"export default function (api) {",
+				"  api.registerTool({ name: 'never', description: 'must not load',",
+				"    parameters: api.typebox.Type.Object({}),",
+				"    async execute() { return { content: [{ type: 'text', text: '' }] }; },",
+				"  });",
+				"}",
+			].join("\n"),
+		);
 		// Subscribes to the bus without declaring it: the load must name the
 		// member and the kind, not leave the extension to read
 		// `api.events.on is not a function` with no clue what was missing.
@@ -194,6 +209,14 @@ describe("extension capability grants (loaded from disk)", () => {
 		const result = await load("unknown-capability.ts");
 		expect(result.extensions).toHaveLength(0);
 		expect(result.errors[0]?.error).toContain("host:escalate");
+	});
+
+	it("fails the load naming the shape of a capability it cannot use", async () => {
+		const result = await load("malformed-capability.ts");
+		expect(result.extensions).toHaveLength(0);
+		expect(result.errors[0]?.error).toContain("entry #0");
+		expect(result.errors[0]?.error).toContain("to be an array of strings");
+		expect(result.errors[0]?.error).not.toContain("Declare it in the extension");
 	});
 
 	it("fails the load with the bus member and kind when the bus was not declared", async () => {
