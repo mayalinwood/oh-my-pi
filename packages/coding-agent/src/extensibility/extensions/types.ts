@@ -168,6 +168,7 @@ import type {
 	ExtensionAskDialogSubmitResult,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import type { ResolvedExtensionGrants } from "./capabilities";
+import type { ExtensionManifest } from "./manifest";
 export type {
 	ExtensionAskDialogOption,
 	ExtensionAskDialogQuestion,
@@ -2286,6 +2287,12 @@ export interface Extension {
 	 * given exposes no privileged member.
 	 */
 	grants?: ResolvedExtensionGrants;
+	/**
+	 * What this extension published about itself for review. Absent means it
+	 * publishes no review identity, the same default-closed shape as an absent
+	 * capability declaration.
+	 */
+	manifest?: ExtensionManifest;
 }
 
 /**
@@ -2303,6 +2310,11 @@ export interface PreparedExtension {
 	 * extension that declares nothing reaches no privileged host member.
 	 */
 	capabilities?: unknown;
+	/**
+	 * The raw `manifest` export, validated when the module is bound so a
+	 * malformed manifest surfaces as a load error rather than a throw here.
+	 */
+	manifest?: unknown;
 	/**
 	 * Set when the host constructed this module itself (an inline factory).
 	 * The caller already holds everything it passes on, so rebinding it into a

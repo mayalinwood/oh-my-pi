@@ -68,10 +68,17 @@ import {
 	resolveExtensionGrants,
 	type ResolvedExtensionGrants,
 } from "./capabilities";
-installLegacyPiSpecifierShim();
 
+import { assertManifestMirrorsCapabilities, readExtensionManifest, type ExtensionManifest } from "./manifest";
+installLegacyPiSpecifierShim();
+type LoadedExtensionModule =
+	| ExtensionFactory
+	| {
+			default?: ExtensionFactory;
+			capabilities?: unknown;
+			manifest?: unknown;
+	  };
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
-type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory; capabilities?: unknown };
 type SettingsSectionOwner = { readonly token: symbol; readonly extensionPath: string };
 
 /**
@@ -84,6 +91,18 @@ type SettingsSectionOwner = { readonly token: symbol; readonly extensionPath: st
 function getExtensionCapabilities(module: LoadedExtensionModule): unknown {
 	if (typeof module === "function") return undefined;
 	return module.capabilities;
+}
+
+/**
+ * Read the review manifest a module exports alongside its factory.
+ *
+ * Nothing is executed to obtain it, so a reviewer can read what an extension
+ * claims without running it. A module that exports none simply has no review
+ * identity, which is not an error.
+ */
+function getExtensionManifest(module: LoadedExtensionModule): unknown {
+	if (typeof module === "function") return undefined;
+	return module.manifest;
 }
 
 function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | null {
@@ -455,11 +474,17 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.runtime.unregisterProvider(name, this.extension.path);
 	}
 }
-function createExtension(extensionPath: string, resolvedPath: string, grants: ResolvedExtensionGrants): Extension {
+function createExtension(
+	extensionPath: string,
+	resolvedPath: string,
+	grants: ResolvedExtensionGrants,
+	manifest?: ExtensionManifest,
+): Extension {
 	return {
 		path: extensionPath,
 		resolvedPath,
 		grants,
+		...(manifest === undefined ? {} : { manifest }),
 		handlers: new Map(),
 		tools: new Map(),
 		toolRegistrationListeners: new Set(),
@@ -527,6 +552,7 @@ async function importExtensionModule(extensionPath: string, cwd: string): Promis
 			resolvedPath,
 			error: null,
 			capabilities: getExtensionCapabilities(module),
+			manifest: getExtensionManifest(module),
 		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -556,7 +582,13 @@ async function bindExtension(
 	}
 	try {
 		const grants = imported.trusted === true ? fullExtensionGrants() : resolveExtensionGrants(imported.capabilities);
-		const extension = createExtension(extensionPath, imported.resolvedPath, grants);
+		// A manifest is validated here rather than at import so a malformed one
+		// is reported as a load error naming the file, not a throw from the
+		// import. The mirror check keeps the review document from lying about
+		// reach, which is the only reason it is worth carrying at all.
+		const manifest = readExtensionManifest(imported.manifest, extensionPath);
+		if (manifest !== undefined) assertManifestMirrorsCapabilities(manifest, imported.capabilities, extensionPath);
+		const extension = createExtension(extensionPath, imported.resolvedPath, grants, manifest);
 		if (grants.unknown.length > 0) {
 			return {
 				extension: null,
@@ -646,6 +678,18 @@ export async function bindPreparedExtensions(
 		}
 
 		if (extension) {
+			// A manifest name is the extension's review identity, so two
+			// extensions claiming one name would make that identity
+			// ambiguous. Refuse the later claimant rather than letting load
+			// order decide which one a reviewer thought they were reading.
+			const claimed = extension.manifest;
+			if (claimed !== undefined && extensions.some(other => other.manifest?.name === claimed.name)) {
+				errors.push({
+					path: prepared.path,
+					error: `Extension declares the manifest name "${claimed.name}", already claimed by another loaded extension`,
+				});
+				continue;
+			}
 			extensions.push(extension);
 		}
 	}

@@ -219,6 +219,64 @@ Handler/tool context (`ctx`):
 | `model`, `models`                                                 | `model:read`       |
 | `newSession`, `branch`, `navigateTree`, `switchSession`, `reload` | `session:write`    |
 
+## Declaring a manifest
+
+An extension loaded from a path may also export a `manifest`. Following the Codex
+model, the manifest is what the extension *claims* about itself, published so a
+reviewer can read that claim without executing the module:
+
+```ts
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+export const capabilities = [
+  { kind: "events:subscribe" },
+  { kind: "tools:register" },
+  { kind: "process:exec", command: "git", args: ["rev-parse", "--show-toplevel"] },
+];
+
+// The same grants, restated for review. The loader checks that the two agree.
+export const manifest = {
+  name: "acme-change-audit",
+  version: "1.2.0",
+  description: "Blocks force pushes and records diffs in session history",
+  capabilities: [
+    { kind: "events:subscribe" },
+    { kind: "tools:register" },
+    { kind: "process:exec", command: "git", args: ["rev-parse", "--show-toplevel"] },
+  ],
+};
+
+export default function (pi: ExtensionAPI) {
+  // only what `capabilities` declared is reachable
+}
+```
+
+- The accepted shape is **closed**: `name`, `version`, optional `description`,
+  optional `capabilities`. `name` must be a string matching
+  `/^[a-z0-9][a-z0-9._-]*$/`; `version` must be a non-empty string and is treated
+  as opaque, never interpreted by the runtime. A non-object, a missing or
+  malformed `name`/`version`, or any key outside that set raises
+  `ExtensionManifestInvalid` and the extension does **not** load — the load
+  fails closed with `Extension "<path>" declares an invalid manifest: <detail>`,
+  naming the file.
+- An **absent** manifest is not an error. The extension then simply has no review
+  identity, exactly as absent `capabilities` means no grants — both default
+  closed.
+- `name` is the review identity and must be **unique among the loaded set**. A
+  second extension claiming a name already taken is refused, so load order cannot
+  decide which module a reviewer thought they were reading.
+- `manifest.capabilities` is an optional **mirror, never the authority**:
+  `capabilities` remains the single source of what the extension may reach, and
+  the mirror exists only so one document carries the claim and the grant
+  together. It is compared **by reach, not by text** — reordering is fine, but a
+  different reach fails the load with `manifest mirrors <...> but the module
+  declares <...>`, and a `process:exec` mirror must name the same command and
+  args rather than a wider pattern. A manifest can therefore neither under-report
+  nor over-report what the extension holds.
+- Hooks and inline factories (`loadExtensionFromFactory`) are outside both
+  mechanisms: the host constructed them, so it is already holding what they
+  reach.
+
 ## Extension API surfaces
 
 ## 1) Registration and actions (`ExtensionAPI`)
@@ -1582,6 +1640,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 
 - Session actions are unavailable during extension load; registration methods, `getFlag`, and `exec` are available.
 - Extensions loaded from a path reach only what they declare, and `capabilities` defaults to empty.
+- A `manifest` is optional, but a malformed one — or one whose `capabilities` mirror disagrees with the module's own `capabilities` — fails that extension's load.
 - `tool_call` errors and timeouts block execution (fail-closed). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
 - Most dispatched handlers have a 30-second budget; `session_shutdown` handlers run concurrently with a 2-second budget. Timing out stops waiting and cancels handler UI, but cannot undo arbitrary extension side effects.
 - Command name conflicts with built-ins are skipped with diagnostics.
