@@ -107,6 +107,19 @@ describe("extension capability grants (loaded from disk)", () => {
 				"}",
 			].join("\n"),
 		);
+
+		// Subscribes to the bus without declaring it: the load must name the
+		// member and the kind, not leave the extension to read
+		// `api.events.on is not a function` with no clue what was missing.
+		await write(
+			"bus-undeclared.ts",
+			[
+				"export const capabilities = [{ kind: 'tools:register' }];",
+				"export default function (api) {",
+				"  api.events.on('acp-session-live', () => {});",
+				"}",
+			].join("\n"),
+		);
 	});
 
 	afterAll(async () => {
@@ -160,5 +173,13 @@ describe("extension capability grants (loaded from disk)", () => {
 		const result = await load("unknown-capability.ts");
 		expect(result.extensions).toHaveLength(0);
 		expect(result.errors[0]?.error).toContain("host:escalate");
+	});
+
+	it("fails the load with the bus member and kind when the bus was not declared", async () => {
+		const result = await load("bus-undeclared.ts");
+		expect(result.extensions).toHaveLength(0);
+		expect(result.errors[0]?.error).toContain("events.on");
+		expect(result.errors[0]?.error).toContain("events:emit");
+		expect(result.errors[0]?.error).not.toContain("is not a function");
 	});
 });

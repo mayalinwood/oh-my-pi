@@ -78,7 +78,7 @@ describe("applyCapabilityGate", () => {
 			exec: (command: string) => `ran ${command}`,
 			sendMessage: () => "sent",
 			getSessionName: () => "session-1",
-			logger: { info: () => {} },
+			logger: { info: () => { } },
 		};
 	}
 
@@ -164,10 +164,47 @@ describe("applyCapabilityGate", () => {
 		);
 		expect(ctx.cwd).toBe("/repo");
 		expect(() => read(ctx, "invokeTool")()).toThrow(ExtensionCapabilityDenied);
-		// A non-callable member is refused just as firmly: the extension never
-		// receives the registry itself, only a stand-in.
+		// A member that is not callable is refused just as firmly: the extension
+		// never receives the registry itself, only a stand-in, and reaching for
+		// the stand-in is what raises the refusal.
 		expect(ctx.modelRegistry).toBeDefined();
-		expect(() => read(ctx, "modelRegistry")()).toThrow(ExtensionCapabilityDenied);
+		expect(() => (ctx.modelRegistry as Record<string, unknown>).secrets).toThrow(ExtensionCapabilityDenied);
+	});
+
+	it("names the member, the property and the kind when a stand-in is reached for", () => {
+		const ctx: Record<string, unknown> = { modelRegistry: { models: ["m"] } };
+		applyCapabilityGate(ctx, CONTEXT_MEMBER_CAPABILITIES, resolveExtensionGrants([]), "/ext/a.ts");
+		try {
+			(ctx.modelRegistry as Record<string, unknown>).models;
+			throw new Error("expected a refusal");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ExtensionCapabilityDenied);
+			expect((error as ExtensionCapabilityDenied).capability).toBe("model:registry");
+			expect((error as Error).message).toContain("/ext/a.ts");
+			expect((error as Error).message).toContain("modelRegistry.models");
+			expect((error as Error).message).toContain("model:registry");
+		}
+	});
+
+	it("answers undefined for the keys an await, a coercion or inspection reaches for", async () => {
+		const ctx: Record<string, unknown> = { modelRegistry: { models: ["m"] } };
+		applyCapabilityGate(ctx, CONTEXT_MEMBER_CAPABILITIES, resolveExtensionGrants([]), "/ext/a.ts");
+		const stand = ctx.modelRegistry as Record<string | symbol, unknown>;
+		expect(stand.then).toBeUndefined();
+		expect(stand.toJSON).toBeUndefined();
+		expect(stand[Symbol.toStringTag]).toBeUndefined();
+		expect(await Promise.resolve(stand)).toBe(stand);
+	});
+
+	it("refuses writing to, calling and constructing a member it does not hold", () => {
+		const ctx: Record<string, unknown> = { modelRegistry: { models: ["m"] } };
+		applyCapabilityGate(ctx, CONTEXT_MEMBER_CAPABILITIES, resolveExtensionGrants([]), "/ext/a.ts");
+		const stand = ctx.modelRegistry as Record<string, unknown>;
+		expect(() => {
+			stand.models = ["sneaked"];
+		}).toThrow(ExtensionCapabilityDenied);
+		expect(() => (stand as unknown as () => unknown)()).toThrow(ExtensionCapabilityDenied);
+		expect(() => new (stand as unknown as new () => unknown)()).toThrow(ExtensionCapabilityDenied);
 	});
 
 	it("cannot be undone by reassigning a denied member", () => {
@@ -177,5 +214,14 @@ describe("applyCapabilityGate", () => {
 			api["sendMessage"] = () => "sneaked";
 		}).toThrow();
 		expect(() => call(api, "sendMessage")).toThrow(ExtensionCapabilityDenied);
+	});
+
+	it("cannot be undone by reassigning a denied stand-in either", () => {
+		const ctx: Record<string, unknown> = { modelRegistry: { models: ["m"] } };
+		applyCapabilityGate(ctx, CONTEXT_MEMBER_CAPABILITIES, resolveExtensionGrants([]), "/ext/a.ts");
+		expect(() => {
+			ctx["modelRegistry"] = { models: ["sneaked"] };
+		}).toThrow();
+		expect(() => (ctx.modelRegistry as Record<string, unknown>).models).toThrow(ExtensionCapabilityDenied);
 	});
 });

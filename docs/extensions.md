@@ -156,6 +156,13 @@ export default function (pi: ExtensionAPI) {
   (`Failed to load extension: Extension "<path>" used "registerTool", which requires
   the "tools:register" capability...`); an undeclared runtime action instead throws at
   the call site, inside the handler that called it.
+- The stand-in is shaped like the member it replaces, so the refusal lands on the
+  operation the extension actually performed. A callable member refuses when it is
+  called; a member that is **not** callable — `pi.events`, `ctx.modelRegistry` —
+  refuses when a property of it is reached for, and the message then names the
+  property too (`used "events.on"`). Reading such a stand-in never yields the real
+  object, and calling, constructing or writing to it is refused the same way.
+
 - Grants bound *what an extension may reach*, not what a granted reach may do once inside
   the process. Extensions are **not sandboxed** — see
   [`extension-loading.md`](./extension-loading.md#runtime-isolation-model).

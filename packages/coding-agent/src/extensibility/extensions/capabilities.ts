@@ -237,14 +237,63 @@ export function grantsAllowExec(grants: ResolvedExtensionGrants, command: string
 }
 
 /**
+ * Keys a coercion or an await may reach for without meaning to use the member
+ * that stands in for it: runtime inspection probes symbols, `await` probes
+ * `then`, `JSON.stringify` probes `toJSON`. Answering `undefined` keeps those
+ * paths from raising a second, unrelated error on top of the refusal, and none
+ * of them reaches the real member. Answering `then` is deliberate even though it
+ * marks the stand-in thenable: the refusal, not a second error, is what the
+ * extension must see.
+ */
+// oxlint-disable-next-line unicorn/no-thenable -- see above
+const REFUSAL_COERCION_KEYS: Record<string, true> = { then: true, toJSON: true };
+
+/**
+ * A stand-in for a denied member that is not callable: the event bus, a model
+ * registry, a service-tier list.
+ *
+ * A function stub only fails once the extension calls a method the stub never
+ * had, so the extension reads `x.y is not a function` several frames away from
+ * the declaration that was missing. Refusing the property access instead puts
+ * the extension path, the member, the property and the kind in the message at
+ * the call site, which is the whole reason the member is gated.
+ */
+function makeRefusedMember(
+	extensionPath: string,
+	member: string,
+	capability: ExtensionCapabilityKind,
+): unknown {
+	const refuse = (): never => {
+		throw new ExtensionCapabilityDenied(extensionPath, member, capability);
+	};
+	// A function as the proxy target, so calling or constructing the stand-in
+	// reaches the trap below: a proxy over a plain object is not callable at
+	// all, and the engine would report `not a function` before the refusal.
+	return new Proxy(function () {}, {
+		get: (_target, property) => {
+			if (typeof property === "symbol" || REFUSAL_COERCION_KEYS[property]) return undefined;
+			throw new ExtensionCapabilityDenied(extensionPath, `${member}.${String(property)}`, capability);
+		},
+		set: refuse,
+		apply: refuse,
+		construct: refuse,
+	});
+}
+
+/**
+ * The stand-in that replaces a member whose capability was not granted.
  *
  * `process:exec` is the one capability whose grant is parameterised, so a
- * holder keeps the real member and the host checks each invocation instead.
+ * holder keeps the real member and the host checks each invocation instead. A
+ * callable member is refused by calling it; a member that is not callable is
+ * refused by reaching for it, so the diagnostic lands where the extension
+ * looked for the power.
  */
 function makeDeniedMember(
 	extensionPath: string,
 	member: string,
 	capability: ExtensionCapabilityKind,
+	original: unknown,
 	execCheck?: ExecGrantCheck,
 ): unknown {
 	if (capability === "process:exec" && execCheck) {
@@ -257,6 +306,9 @@ function makeDeniedMember(
 			}
 			return deny();
 		};
+	}
+	if (typeof original !== "function") {
+		return makeRefusedMember(extensionPath, member, capability);
 	}
 	return () => {
 		throw new ExtensionCapabilityDenied(extensionPath, member, capability);
@@ -271,10 +323,12 @@ export interface ExecGrantCheck {
 
 /**
  * Replace every member of `target` whose capability was not granted with a
- * stub that refuses and names the missing grant.
+ * stand-in that refuses and names the missing grant.
  *
- * Refusing rather than deleting keeps the object's shape stable, so a denied
- * call surfaces as a legible error at the call site instead of an
+ * Refusing rather than deleting keeps the object's shape stable, and the
+ * stand-in is shaped like the member it replaces: a callable member refuses
+ * when called, a member that is not callable refuses when reached for. Either
+ * way the refusal names the declaration the extension is missing, instead of an
  * `undefined is not a function` several frames away. Members absent from the
  * table are not privileged and are left untouched.
  */
@@ -287,6 +341,7 @@ export function applyCapabilityGate(
 ): void {
 	for (const [member, capability] of Object.entries(table)) {
 		if (!(member in target)) continue;
+		const value = (target as Record<string, unknown>)[member];
 		// A held `process:exec` is still wrapped: its grant names a command
 		// and argument patterns, so the decision belongs to the individual
 		// invocation rather than to load time. An unheld one is refused
@@ -296,7 +351,7 @@ export function applyCapabilityGate(
 		const granted = grants.kinds.has(capability);
 		if (parameterised ? granted && !execCheck : granted) continue;
 		Object.defineProperty(target, member, {
-			value: makeDeniedMember(extensionPath, member, capability, execCheck),
+			value: makeDeniedMember(extensionPath, member, capability, value, execCheck),
 			writable: false,
 			configurable: true,
 		});
