@@ -35,6 +35,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { YAML } from "bun";
 
 describe("ExtensionRunner", () => {
 	let tempDir: TempDir;
@@ -72,14 +73,20 @@ describe("ExtensionRunner", () => {
 		tempDir.removeSync();
 	});
 
-	const loadTestExtensions = async (configuredPaths: string[] = []) => {
+	const loadTestExtensions = async (configuredPaths: string[] = [], settingsInstance?: Settings) => {
 		const discoveredPaths = fs
 			.readdirSync(extensionsDir, { withFileTypes: true })
 			.filter(entry => entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js")))
 			.map(entry => path.join(extensionsDir, entry.name))
 			.sort();
 		const explicitPaths = configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath));
-		const result = await loadExtensions([...discoveredPaths, ...explicitPaths], tempDir.path());
+		const result = await loadExtensions(
+			[...discoveredPaths, ...explicitPaths],
+			tempDir.path(),
+			undefined,
+			undefined,
+			settingsInstance,
+		);
 		const testRoots = [
 			extensionsDir,
 			...configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath)),
@@ -565,6 +572,7 @@ describe("ExtensionRunner", () => {
 	describe("assistant_message", () => {
 		it("chains text rewrites, ignores in-place edits, and preserves non-text blocks", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => {
 						event.message.content[0].text = "ignored";
@@ -610,6 +618,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-cursor.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({ content: event.message.content }));
 					pi.on("assistant_message", event => ({
@@ -652,6 +661,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-signatures.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({
 						content: [
@@ -738,7 +748,7 @@ describe("ExtensionRunner", () => {
 		] as const)("rejects %s topology or metadata changes", async (_case, content) => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-invalid.ts"),
-				`export default pi => pi.on("assistant_message", () => ({ content: ${JSON.stringify(content)} }));`,
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default pi => pi.on("assistant_message", () => ({ content: ${JSON.stringify(content)} }));`,
 			);
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
@@ -769,6 +779,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-abort.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({
 						content: event.message.content.map(block =>
@@ -806,7 +817,7 @@ describe("ExtensionRunner", () => {
 		it("rejects attempts to change tool calls", async () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-invalid.ts"),
-				`export default pi => pi.on("assistant_message", () => ({ content: [{ type: "text", text: "lost tool" }] }));`,
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default pi => pi.on("assistant_message", () => ({ content: [{ type: "text", text: "lost tool" }] }));`,
 			);
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
@@ -2427,6 +2438,367 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("extension settings section API", () => {
+		const extensionSource = `
+			export default function(pi) {
+				const fields = [
+					{ key: "enabled", label: "Enabled", description: "Enable review.", type: "boolean", default: true },
+					{ key: "maxReviews", label: "Maximum reviews", description: "Bounded count.", type: "integer", min: 1, max: 100, default: 24 },
+					{ key: "costCutoffUsd", label: "Cost cutoff", description: "Finite USD cutoff.", type: "number", min: 0, max: 1, default: 1 },
+					{ key: "requiredRisk", label: "Required risk", description: "Required risk level.", type: "enum", values: ["low", "medium", "high"], default: "high" },
+					{ key: "reviewer", label: "Reviewer", description: "Stable name or automatic.", type: "text", minLength: 1, maxLength: 64, pattern: "automatic|[A-Za-z0-9][A-Za-z0-9._-]{0,63}", default: "automatic" },
+				];
+				const definition = {
+					id: "review-policy",
+					label: "Review policy",
+					description: "Bounded review admission.",
+					fields,
+					getStatus: () => [
+						{ label: "Reviewer status", value: globalThis.__extensionSettingsLive ?? "idle" },
+					],
+				};
+				const snapshot = pi.registerSettingsSection(definition);
+				definition.id = "redirected-policy";
+				definition.fields = [];
+				definition.getStatus = () => [{ label: "Mutated status", value: "wrong" }];
+				fields[1].key = "redirectedKey";
+				fields[1].default = 99;
+				globalThis.__extensionSettingsSnapshot = snapshot;
+				globalThis.__extensionSettingsSnapshotFrozen = Object.isFrozen(snapshot);
+			}
+		`;
+
+		it("returns defaults, accepts inclusive bounds, persists project values, and keeps the startup snapshot immutable", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const projectConfigPath = path.join(tempDir.path(), ".omp", "config.yml");
+			fs.mkdirSync(path.dirname(projectConfigPath), { recursive: true });
+			fs.writeFileSync(
+				projectConfigPath,
+				YAML.stringify(
+					{
+						extensionSettings: {
+							"review-policy": {
+								enabled: false,
+								maxReviews: 100,
+								costCutoffUsd: 0,
+								requiredRisk: "low",
+								reviewer: "Security",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+			const settingsInstance = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "agent"),
+			});
+			const globalState = globalThis as typeof globalThis & {
+				__extensionSettingsLive?: string;
+				__extensionSettingsSnapshot?: unknown;
+				__extensionSettingsSnapshotFrozen?: boolean;
+			};
+			globalState.__extensionSettingsLive = "running";
+
+			const loaded = await loadTestExtensions([extensionPath], settingsInstance);
+			expect(loaded.errors).toEqual([]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				settingsInstance,
+			);
+			const [section] = runner.getSettingsSections();
+			expect(section).toBeDefined();
+			expect(globalState.__extensionSettingsSnapshotFrozen).toBe(true);
+			expect(globalState.__extensionSettingsSnapshot).toEqual({
+				enabled: false,
+				maxReviews: 100,
+				costCutoffUsd: 0,
+				requiredRisk: "low",
+				reviewer: "Security",
+			});
+			expect(section?.getStatus()).toEqual([{ label: "Reviewer status", value: "running", description: undefined }]);
+			expect(section?.id).toBe("review-policy");
+			expect(section?.fields.map(field => field.key)).toEqual([
+				"enabled",
+				"maxReviews",
+				"costCutoffUsd",
+				"requiredRisk",
+				"reviewer",
+			]);
+			expect(Object.isFrozen(section)).toBe(true);
+			expect(Object.isFrozen(section?.fields)).toBe(true);
+			expect(section?.fields.every(field => Object.isFrozen(field))).toBe(true);
+
+			section?.setValue("maxReviews", 1);
+			section?.setValue("costCutoffUsd", 1);
+			section?.setValue("reviewer", "automatic");
+			expect(section?.readValues()).toMatchObject({ maxReviews: 1, costCutoffUsd: 1, reviewer: "automatic" });
+			expect(section?.isRestartRequired()).toBe(true);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({
+				maxReviews: 100,
+				costCutoffUsd: 0,
+				reviewer: "Security",
+			});
+			await settingsInstance.flush();
+
+			const persisted = YAML.parse(fs.readFileSync(projectConfigPath, "utf8")) as {
+				extensionSettings: Record<string, Record<string, unknown>>;
+			};
+			expect(persisted.extensionSettings["review-policy"]).toMatchObject({
+				maxReviews: 1,
+				costCutoffUsd: 1,
+				reviewer: "automatic",
+			});
+			expect(fs.readFileSync(projectConfigPath, "utf8")).not.toContain("Reviewer status");
+
+			const readbackSettings = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "readback-agent"),
+			});
+			const readback = await loadExtensions([extensionPath], tempDir.path(), undefined, undefined, readbackSettings);
+			expect(readback.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({
+				maxReviews: 1,
+				costCutoffUsd: 1,
+				reviewer: "automatic",
+			});
+
+			const defaultsRoot = path.join(tempDir.path(), "defaults");
+			fs.mkdirSync(defaultsRoot, { recursive: true });
+			const defaultSettings = await Settings.loadIsolated({
+				cwd: defaultsRoot,
+				agentDir: path.join(defaultsRoot, "agent"),
+			});
+			const defaults = await loadExtensions([extensionPath], defaultsRoot, undefined, undefined, defaultSettings);
+			expect(defaults.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toEqual({
+				enabled: true,
+				maxReviews: 24,
+				costCutoffUsd: 1,
+				requiredRisk: "high",
+				reviewer: "automatic",
+			});
+
+			const autoScopedRoot = path.join(tempDir.path(), "auto-scoped");
+			const autoScopedConfig = path.join(autoScopedRoot, ".omp", "config.yml");
+			fs.mkdirSync(path.dirname(autoScopedConfig), { recursive: true });
+			fs.writeFileSync(
+				autoScopedConfig,
+				YAML.stringify({ extensionSettings: { "review-policy": { maxReviews: 7 } } }, null, 2),
+			);
+			const autoScoped = await loadExtensions([extensionPath], autoScopedRoot);
+			expect(autoScoped.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({ maxReviews: 7 });
+		});
+
+		it("rejects each malformed section atomically instead of weakening defaults", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section-invalid.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const invalidSections: unknown[] = [
+				{ maxReviews: 0 },
+				{ maxReviews: 101 },
+				{ maxReviews: 1.5 },
+				{ costCutoffUsd: "0.5" },
+				{ requiredRisk: "urgent" },
+				{ reviewer: "Security reviewer" },
+				{ reviewer: "Security\n" },
+				{ unknownPolicyKey: true },
+			];
+			const globalState = globalThis as typeof globalThis & { __extensionSettingsSnapshot?: unknown };
+
+			for (let index = 0; index < invalidSections.length; index++) {
+				const cwd = path.join(tempDir.path(), `invalid-${index}`);
+				const configPath = path.join(cwd, ".omp", "config.yml");
+				fs.mkdirSync(path.dirname(configPath), { recursive: true });
+				fs.writeFileSync(
+					configPath,
+					YAML.stringify({ extensionSettings: { "review-policy": invalidSections[index] } }, null, 2),
+				);
+				const settingsInstance = await Settings.loadIsolated({
+					cwd,
+					agentDir: path.join(cwd, "agent"),
+				});
+				globalState.__extensionSettingsSnapshot = "registration-rejected";
+				const loaded = await loadExtensions([extensionPath], cwd, undefined, undefined, settingsInstance);
+
+				expect(loaded.extensions).toEqual([]);
+				expect(loaded.errors).toHaveLength(1);
+				expect(loaded.errors[0]?.error).toContain("Failed to load extension");
+				expect(globalState.__extensionSettingsSnapshot).toBe("registration-rejected");
+			}
+		});
+
+		it("rejects duplicate section ids from distinct extension instances even when their diagnostic paths match", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section-duplicate.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const settingsInstance = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "duplicate-agent"),
+			});
+
+			const loaded = await loadExtensions(
+				[extensionPath, extensionPath],
+				tempDir.path(),
+				undefined,
+				undefined,
+				settingsInstance,
+			);
+
+			expect(loaded.extensions).toHaveLength(1);
+			expect(loaded.errors).toHaveLength(1);
+			expect(loaded.errors[0]?.error).toContain('Extension settings section "review-policy" is already registered');
+		});
+	});
+
+	describe("advisor lifecycle API", () => {
+		it("delegates content-free status and control requests through the loaded extension API", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_start", () => {
+						globalThis.__advisorLifecycleApi = {
+							status: pi.getAdvisorStatus(),
+							result: pi.ensureAdvisor({
+								enabled: true,
+								reason: "deterministic policy",
+								idempotencyKey: "review-1",
+								resetMode: "context",
+							}),
+						};
+					});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "advisor-lifecycle.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+			const globalState = globalThis as typeof globalThis & { __advisorLifecycleApi?: unknown };
+			delete globalState.__advisorLifecycleApi;
+			const requests: unknown[] = [];
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					getAdvisorStatus: () => ({
+						generation: 4,
+						configured: true,
+						enabled: true,
+						active: true,
+						advisors: [
+							{
+								name: "Security",
+								status: "running",
+								active: true,
+								model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+								configuredToolNames: ["read", "grep"],
+							},
+						],
+						tokens: 42,
+						cost: 0.25,
+					}),
+					ensureAdvisor: request => {
+						requests.push(request);
+						return {
+							outcome: "unchanged" as const,
+							reason: request.reason,
+							generation: 5,
+							idempotent: false,
+							resetApplied: true,
+							enabled: true,
+							active: true,
+							advisors: ["Security"],
+						};
+					},
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(requests).toEqual([
+				{
+					enabled: true,
+					reason: "deterministic policy",
+					idempotencyKey: "review-1",
+					resetMode: "context",
+				},
+			]);
+			expect(globalState.__advisorLifecycleApi).toEqual({
+				status: {
+					generation: 4,
+					configured: true,
+					enabled: true,
+					active: true,
+					advisors: [
+						{
+							name: "Security",
+							status: "running",
+							active: true,
+							model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+							configuredToolNames: ["read", "grep"],
+						},
+					],
+					tokens: 42,
+					cost: 0.25,
+				},
+				result: {
+					outcome: "unchanged",
+					reason: "deterministic policy",
+					generation: 5,
+					idempotent: false,
+					resetApplied: true,
+					enabled: true,
+					active: true,
+					advisors: ["Security"],
+				},
+			});
+			delete globalState.__advisorLifecycleApi;
+		});
+
+		it("keeps Advisor actions unavailable during extension load", async () => {
+			const explicitExtensionPath = path.join(tempDir.path(), "advisor-lifecycle-load.ts");
+			fs.writeFileSync(explicitExtensionPath, `export default function(pi) { pi.getAdvisorStatus(); }`);
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const loadError = result.errors.find(error => error.path.includes("advisor-lifecycle-load.ts"));
+
+			expect(loadError?.error).toContain("Extension runtime not initialized");
+		});
+	});
+
 	describe("session name API", () => {
 		it("lets extensions read and set the session name after initialization", async () => {
 			const extCode = `
@@ -3439,12 +3811,14 @@ describe("ExtensionRunner", () => {
 
 		it("preserves additional context from every tool_result handler in registration order", async () => {
 			const first = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "first result context" }));
 					pi.on("tool_result", async () => ({ additionalContext: "   " }));
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "second result context" }));
 				}
@@ -3477,7 +3851,7 @@ describe("ExtensionRunner", () => {
 		it("keeps an earlier extension's redaction when a later one returns only repeated context", async () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "tool-result-redact-a.ts"),
-				`export default function(pi) {
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 					pi.on("tool_result", async () => ({
 						content: [{ type: "text", text: "token [REDACTED]" }],
 						additionalContext: "use the redacted result",
@@ -3486,7 +3860,7 @@ describe("ExtensionRunner", () => {
 			);
 			fs.writeFileSync(
 				path.join(extensionsDir, "tool-result-redact-b.ts"),
-				`export default function(pi) {
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "use the redacted result  " }));
 				}`,
 			);
@@ -3520,6 +3894,7 @@ describe("ExtensionRunner", () => {
 
 		it("forwards failure-specific tool_result context through the tool context", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) =>
 						event.isError ? { additionalContext: "inspect the failure before retrying" } : undefined);

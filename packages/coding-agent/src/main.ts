@@ -518,6 +518,7 @@ async function loadTrustedSessionExtensions(
 	options: Pick<CreateAgentSessionOptions, "additionalExtensionPaths">,
 	cwd: string,
 	eventBus: EventBus,
+	settingsInstance: Settings,
 ) {
 	const paths = options.additionalExtensionPaths ?? [];
 	for (const trustedPath of paths) {
@@ -531,7 +532,7 @@ async function loadTrustedSessionExtensions(
 			throw new Error(`Trusted extension must be a module file, not a directory: ${trustedPath}`);
 		}
 	}
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, undefined, settingsInstance);
 }
 
 /**
@@ -559,7 +560,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		const eventBus = new EventBus();
 		const trustedExtensions =
 			args.parsedArgs.trustedExtensions && args.parsedArgs.trustedExtensions.length > 0
-				? await loadTrustedSessionExtensions(args.baseOptions, cwd, eventBus)
+				? await loadTrustedSessionExtensions(args.baseOptions, cwd, eventBus, nextSettings)
 				: undefined;
 		if (trustedExtensions && trustedExtensions.errors.length > 0) {
 			throw new Error(
@@ -2403,7 +2404,7 @@ export async function runRootCommand(
 				!parsedArgs.tools?.length &&
 				!(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || parsedArgs.restore || foreignSource);
 			const extensionsResult = parsedArgs.trustedExtensions?.length
-				? { ...(await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)), deferredPaths: [] }
+				? { ...(await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus, settingsInstance)), deferredPaths: [] }
 				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, {
 						deferStartupSafe: deferStartupSafeExtensions,
 					});

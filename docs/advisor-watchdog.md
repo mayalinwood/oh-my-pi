@@ -6,6 +6,7 @@ An advisor does not approve actions or mutate primary session state directly. It
 
 ## Implementation files
 
+- [`src/advisor/control.ts`](../packages/coding-agent/src/advisor/control.ts)
 - [`src/advisor/runtime.ts`](../packages/coding-agent/src/advisor/runtime.ts)
 - [`src/advisor/advise-tool.ts`](../packages/coding-agent/src/advisor/advise-tool.ts)
 - [`src/advisor/emission-guard.ts`](../packages/coding-agent/src/advisor/emission-guard.ts)
@@ -111,6 +112,47 @@ Slash commands:
 If the subsystem is enabled but no legacy/default or roster model resolves, status reports the configured advisors as inactive/`no_model`.
 
 Entries left at `no_model` during startup are retried after background model discovery settles, so a model that arrives late in the catalog can start without a manual toggle.
+
+### Extension lifecycle API
+
+Extensions can inspect and control Advisor through the supported public
+`ExtensionAPI` methods `getAdvisorStatus()` and `ensureAdvisor(request)`. The
+same methods are wired in TUI, ACP, print/RPC, and task/subagent extension
+hosts. Extensions targeting older OMP versions must feature-detect both methods
+and fail closed when either is absent; private `SessionAdvisors` imports and
+synthetic `/advisor` command dispatch are unsupported.
+
+`getAdvisorStatus()` exposes enabled/active state, the configured roster,
+per-advisor runtime status/model/configured tool names, aggregate tokens,
+cumulative cost, and a session-local generation. It intentionally exposes no
+transcript content.
+
+`ensureAdvisor` requires `enabled`, a non-empty `reason`, and a non-empty
+`idempotencyKey`. `resetMode` accepts `none` (default) or `context`; callers may
+name one `advisor`, or set `allowMultiple: true` to explicitly scope a
+multi-advisor roster. Ambiguous scope is `rejected`; an unknown advisor or
+unresolved model is `unavailable`, with no partial activation. Outcomes are
+`enabled`, `disabled`, `unchanged`, `unavailable`, or `rejected`, and every
+result reports generation, dedupe status, whether a reset applied, current
+enabled/active state, and resolved advisor names.
+
+Idempotency is session-local. Reusing a completed key returns its original
+outcome with `idempotent: true`, the current lifecycle generation and current
+enabled/active state, without repeating provider or runtime work. A
+conversation/session reset clears the key ledger. Context
+refresh must cover every active advisor because the delivery queue is shared;
+a named advisor is valid when it is the only active runtime, otherwise use
+`allowMultiple: true`. For the same reason, a scoped enable/disable that would
+replace an active advisor outside its scope is rejected. Refresh drops private
+context, emission dedupe/cooldown state, and stale queued deliveries, then seeds
+each cursor to the current primary transcript. Refresh never replays prior
+primary history, rewinds the primary session, starts a primary turn, or clears
+cumulative Advisor cost. Disable also drops stale deliveries and preserves cost.
+
+Automatic activation is intentionally policy-neutral at the API boundary.
+Extensions **must** use a deterministic, auditable risk/cost policy with a
+bounded review window and explicit idempotency key. Do not activate based on
+model intuition, timers, polling, or opportunistic retries.
 
 ## What the advisor sees
 

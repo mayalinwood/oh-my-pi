@@ -116,13 +116,14 @@ export default function (pi: ExtensionAPI) {
 Core methods:
 
 - `on(event, handler)`
-- `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
+- `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`, `registerSettingsSection`
 - `registerMessageRenderer`, `registerAssistantThinkingRenderer`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
 - `getCommands`
+- `getAdvisorStatus`, `ensureAdvisor`
 - `getSessionName`, `setSessionName`
 - `setModel`, `getThinkingLevel`, `setThinkingLevel`
 - `getServiceTiers`, `setServiceTier`
@@ -135,6 +136,155 @@ Core methods:
 `setLabel(label)` sets the extension's display label. It is not a session-entry
 labeling action. `getAllTools()` returns tool schemas and source metadata, while
 `getActiveTools()` returns enabled names.
+
+### Native settings sections
+
+`registerSettingsSection()` adds a named section to the **Extensions** tab in
+native `/settings`, where its description is rendered with the section heading.
+Call it while the extension factory is loading. The return value is a frozen,
+validated startup snapshot:
+
+```ts
+const policy = pi.registerSettingsSection({
+  id: "review-policy",
+  label: "Review policy",
+  description: "Bounded review admission owned by this extension.",
+  fields: [
+    {
+      key: "maxReviews",
+      label: "Maximum reviews",
+      description: "Maximum reviews opened by one process.",
+      type: "integer",
+      min: 0,
+      max: 10,
+      default: 2,
+    },
+    {
+      key: "costCutoffUsd",
+      label: "Cost cutoff (USD)",
+      description: "Reject admission at or above this cumulative cost.",
+      type: "number",
+      min: 0,
+      max: 5,
+      default: 1,
+    },
+    {
+      key: "requiredRisk",
+      label: "Required risk",
+      description: "Risk level at which review is mandatory.",
+      type: "enum",
+      values: ["low", "medium", "high"] as const,
+      default: "high",
+    },
+    {
+      key: "reviewer",
+      label: "Reviewer",
+      description: "Stable reviewer name, or automatic.",
+      type: "text",
+      minLength: 1,
+      maxLength: 64,
+      pattern: "automatic|[A-Za-z0-9][A-Za-z0-9._-]*",
+      default: "automatic",
+    },
+  ] as const,
+  getStatus: () => [
+    { label: "Reviewer", value: currentReviewerName },
+    { label: "Usage", value: `${tokens} tokens / $${cost.toFixed(4)}` },
+  ],
+});
+```
+
+Supported field types are `boolean`, finite `number`, finite `integer`,
+`enum`, and non-secret `text`. Numeric bounds, enum membership, text lengths,
+full-value patterns (including rejection of a trailing newline), defaults,
+duplicate keys, unknown persisted keys, and persisted value types are validated
+atomically. Invalid persisted configuration rejects the extension load instead
+of partially applying a section.
+
+Values live under the reserved project YAML namespace:
+
+```yaml
+extensionSettings:
+  review-policy:
+    maxReviews: 4
+    costCutoffUsd: 0.75
+    requiredRisk: medium
+    reviewer: Security
+```
+
+Edits in `/settings` are persisted to the requested cwd's `.omp/config.yml`
+and visibly marked **restart required**. Extension loading always binds this
+registration to cwd-scoped settings rather than an unrelated process singleton.
+Edits never mutate `policy`: the active extension keeps its immutable startup
+snapshot until a new OMP process loads. `getStatus` provides read-only live rows;
+those rows are rendered on demand and are never persisted. Status values must
+remain compact and content-free. Never expose
+credentials, transcript or prompt content, paths, or commands through settings
+fields or status rows.
+
+Provider-side hard token or spend limits remain provider-owned. This generic
+settings API does not expose or enforce them; an extension section that reports
+policy status must state that boundary without presenting provider limits as
+configurable policy fields.
+
+
+### Advisor lifecycle actions
+
+`getAdvisorStatus()` returns a content-free snapshot: the session generation,
+whether Advisor is enabled/active, the configured roster, each advisor's runtime
+status/model/configured tool names, and aggregate token count and cumulative
+cost. It never returns primary or Advisor transcript content.
+
+`ensureAdvisor(request)` provides deterministic, session-local lifecycle
+control:
+
+```ts
+const result = pi.ensureAdvisor({
+  enabled: true,
+  advisor: "Security", // omit only for a single-advisor roster
+  reason: "HIGH-risk write batch requires review",
+  idempotencyKey: `review:${verifiedCommit}`,
+  resetMode: "context",
+});
+```
+
+- `reason` and `idempotencyKey` must be non-empty. A repeated key returns the
+  original outcome with `idempotent: true`, the current lifecycle generation and
+  current enabled/active state, and performs no provider or runtime work.
+  Conversation/session reset clears this dedupe ledger.
+- `resetMode` is `"none"` (default) or `"context"`. Context refresh applies only
+  to active advisors and must cover every active advisor because their delivery
+  queue is shared (a named advisor is valid when it is the only active runtime;
+  otherwise use `allowMultiple: true`). OMP resets private context, clears
+  emission/dedupe/cooldown state and stale queued Advisor cards, then seeds each
+  cursor to the current primary transcript. It never rewinds primary history,
+  clears cumulative Advisor cost, replays old context, or starts a primary turn.
+- A request against a multi-advisor roster must name `advisor`, unless
+  `allowMultiple: true` explicitly authorizes the whole roster. Because live
+  runtimes also share delivery state, a scoped enable/disable that would replace
+  an active advisor outside its scope is rejected. Unresolved advisor
+  names/models and ambiguous scope do not partially activate anything.
+- `outcome` is one of `enabled`, `disabled`, `unchanged`, `unavailable`, or
+  `rejected`. Results also include `generation`, `idempotent`, `resetApplied`,
+  current `enabled`/`active`, the resolved advisor names, and an explanatory
+  `reason`.
+
+Extensions supporting older OMP releases must feature-detect both methods and
+fail closed; do not dispatch `/advisor` text or import session internals:
+
+```ts
+if (typeof pi.getAdvisorStatus !== "function" || typeof pi.ensureAdvisor !== "function") {
+  // Report unsupported and leave the primary session unchanged.
+  return;
+}
+```
+
+Automatic activation must be based on a deterministic, auditable risk/cost
+policy (for example a declared HIGH-risk gate with a bounded review window),
+not model intuition, timers, polling, or opportunistic retries. The extension
+owns that policy; OMP only enforces lifecycle/idempotency/scope semantics.
+
+### Service-tier actions
 
 `getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
 

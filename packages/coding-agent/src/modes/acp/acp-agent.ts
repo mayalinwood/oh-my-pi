@@ -2990,6 +2990,8 @@ export class AcpAgent implements Agent {
 				getAllTools: () => record.session.getAllToolInfos(),
 				setActiveTools: toolNames => record.session.setActiveToolsByName(toolNames),
 				getCommands: () => getSessionSlashCommands(record.session),
+				getAdvisorStatus: () => record.session.getAdvisorStatus(),
+				ensureAdvisor: request => record.session.ensureAdvisor(request),
 				setModel: async model => {
 					const apiKey = await record.session.modelRegistry.getApiKey(model);
 					if (!apiKey) {

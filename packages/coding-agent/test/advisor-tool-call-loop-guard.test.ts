@@ -492,6 +492,33 @@ describe("advisor tool-call loop guard", () => {
 		expect(delivered).toContain("second update");
 	});
 
+	it("does not hand a replaced advisor's skipped updates to an advisor that is not the same roster entry", async () => {
+		// The carry is keyed by roster slug. A save that renames the advisor builds a
+		// different advisor: it starts a fresh cadence phase at the current cursor,
+		// so the update the old entry skipped is not replayed under the new name.
+		const { reviewStarts } = createAdvisor({ "advisor.syncBacklog": "1" }, 0, {
+			name: "Interval reviewer",
+			reviewInterval: 2,
+		});
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("first update");
+		expect(reviewStarts).toHaveLength(0);
+		expect(
+			session.applyAdvisorConfigs(
+				[{ name: "Renamed reviewer", reviewInterval: 2, instructions: "Check." }],
+				undefined,
+			),
+		).toBe(1);
+
+		await session.prompt("second update");
+		expect(await session.waitForAdvisorCatchup(2_000)).toBe(true);
+		// Fresh phase: the second update is only the renamed advisor's first
+		// eligible one, so no review is due yet and nothing from "first update"
+		// is replayed.
+		expect(reviewStarts).toHaveLength(0);
+	});
+
 	it("defers agent-end review across tool-loop continuation", async () => {
 		const { contexts } = createAdvisor(
 			{ "advisor.syncBacklog": "1" },

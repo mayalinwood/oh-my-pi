@@ -750,6 +750,16 @@ export class AdvisorRuntime {
 		logger.debug("advisor delivered prefix rebased", { reason, lastCount: this.#lastCount });
 	}
 
+	/**
+	 * Rebuild private Advisor context while keeping the primary cursor at `count`.
+	 * Unlike {@link reset}, the next update contains only transcript entries
+	 * appended after the refresh point.
+	 */
+	refreshContext(count: number, reason = "context-refresh"): void {
+		this.reset(reason);
+		this.seedTo(count);
+	}
+
 	#syncModelIdentity(): void {
 		const identity = this.host.getModelIdentity?.();
 		if (identity === undefined || identity === this.#modelIdentity) return;

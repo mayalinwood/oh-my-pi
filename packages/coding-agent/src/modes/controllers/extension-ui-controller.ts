@@ -239,6 +239,8 @@ export class ExtensionUiController {
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
 			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
+			getAdvisorStatus: () => this.ctx.session.getAdvisorStatus(),
+			ensureAdvisor: request => this.ctx.session.ensureAdvisor(request),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
 		};
@@ -470,6 +472,8 @@ export class ExtensionUiController {
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
 			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
+			getAdvisorStatus: () => this.ctx.session.getAdvisorStatus(),
+			ensureAdvisor: request => this.ctx.session.ensureAdvisor(request),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
 		};

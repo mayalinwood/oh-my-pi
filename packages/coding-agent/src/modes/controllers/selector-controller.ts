@@ -347,6 +347,7 @@ export class SelectorController {
 						),
 						settings: createSettingsHost(),
 						plugins: createPluginSettingsHost(getProjectDir()),
+						extensionSettingsSections: this.ctx.session.extensionRunner?.getSettingsSections(),
 						model: this.ctx.session.model,
 						imageBudget: this.ctx.ui.imageBudget,
 						requestRender: () => this.ctx.ui.requestRender(),
@@ -361,23 +362,6 @@ export class SelectorController {
 								this.ctx.ui.invalidate();
 								this.ctx.ui.requestRender();
 							}
-						},
-						onStatusLinePreview: previewSettings => {
-							// Update status line with preview settings
-							this.ctx.statusLine.updateSettings({
-								preset: cfgStatusLinePreset.get(settings),
-								leftSegments: cfgStatusLineLeftSegments.get(settings),
-								rightSegments: cfgStatusLineRightSegments.get(settings),
-								separator: cfgStatusLineSeparator.get(settings),
-								showHookStatus: cfgStatusLineShowHookStatus.get(settings),
-								sessionAccent: cfgStatusLineSessionAccent.get(settings),
-								transparent: cfgStatusLineTransparent.get(settings),
-								compactThinkingLevel: cfgStatusLineCompactThinkingLevel.get(settings),
-								contextLine: cfgStatusLineContextLine.get(settings),
-								segmentOptions: cfgStatusLineSegmentOptions.get(settings),
-								...previewSettings,
-							});
-							this.ctx.ui.requestRender();
 						},
 						getStatusLinePreview: () => {
 							// The bar exactly as the active composer shape renders it (box top

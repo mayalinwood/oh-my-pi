@@ -413,6 +413,392 @@ describe("AgentSession advisor toggle", () => {
 			await raceSession.dispose();
 		}
 	});
+	it("exposes idempotent enable, no-replay context refresh, and stale-free disable transitions", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const historical: AgentMessage = { role: "user", content: "existing primary history", timestamp: 1 };
+		session.agent.replaceMessages([historical]);
+
+		const enabled = session.ensureAdvisor({
+			enabled: true,
+			reason: "deterministic high-risk review gate",
+			idempotencyKey: "enable-review",
+		});
+		expect(enabled).toMatchObject({
+			outcome: "enabled",
+			idempotent: false,
+			resetApplied: false,
+			enabled: true,
+			active: true,
+			advisors: ["default"],
+		});
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected Advisor runtime after public enable");
+		expect(advisor.state.messages).toEqual([]);
+
+		const duplicate = session.ensureAdvisor({
+			enabled: false,
+			reason: "a changed duplicate must not run",
+			idempotencyKey: "enable-review",
+		});
+		expect(duplicate).toMatchObject({
+			outcome: "enabled",
+			idempotent: true,
+			generation: enabled.generation,
+		});
+		expect(session.getAdvisorAgent()).toBe(advisor);
+
+		appendAdvisorCost(advisor, 0.5, 2);
+		advisor.state.messages.push({ role: "user", content: "stale private context", timestamp: 3 });
+		session.agent.steer({
+			role: "custom",
+			customType: "advisor",
+			content: "stale queued delivery",
+			display: true,
+			attribution: "agent",
+			timestamp: 4,
+		});
+		expect(session.queuedMessageCount).toBe(1);
+
+		const refreshed = session.ensureAdvisor({
+			enabled: true,
+			reason: "verified state changed",
+			idempotencyKey: "refresh-review",
+			resetMode: "context",
+		});
+		expect(refreshed).toMatchObject({ outcome: "unchanged", resetApplied: true, active: true });
+		expect(session.getAdvisorAgent()).toBe(advisor);
+		expect(advisor.state.messages).toEqual([]);
+		expect(session.agent.state.messages).toEqual([historical]);
+		expect(session.queuedMessageCount).toBe(0);
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: refreshed.generation,
+			enabled: true,
+			active: true,
+			tokens: 0,
+			cost: 0.5,
+			advisors: [
+				{
+					name: "default",
+					status: "running",
+					active: true,
+					model: { provider: model.provider, id: model.id },
+					configuredToolNames: ["read", "grep", "glob"],
+				},
+			],
+		});
+
+		const disabled = session.ensureAdvisor({
+			enabled: false,
+			reason: "review window complete",
+			idempotencyKey: "disable-review",
+		});
+		expect(disabled).toMatchObject({ outcome: "disabled", enabled: false, active: false });
+		const replayedEnable = session.ensureAdvisor({
+			enabled: true,
+			reason: "duplicate replay after later lifecycle change",
+			idempotencyKey: "enable-review",
+		});
+		expect(replayedEnable).toMatchObject({
+			outcome: "enabled",
+			idempotent: true,
+			generation: disabled.generation,
+			enabled: false,
+			active: false,
+		});
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+
+	it("rejects ambiguous automatic scope and reports unresolved models without changing the session", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "   ",
+				idempotencyKey: "missing-reason",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", enabled: false, active: false });
+
+		const ambiguous = session.ensureAdvisor({
+			enabled: true,
+			reason: "automatic review",
+			idempotencyKey: "ambiguous-review",
+		});
+		expect(ambiguous).toMatchObject({
+			outcome: "rejected",
+			enabled: false,
+			active: false,
+			advisors: ["Security", "Architecture"],
+		});
+
+		session.applyAdvisorConfigs([{ name: "Unavailable", model: "nonexistent/advisor-model" }], undefined);
+		const unavailable = session.ensureAdvisor({
+			enabled: true,
+			reason: "automatic review",
+			idempotencyKey: "unavailable-review",
+		});
+		expect(unavailable).toMatchObject({
+			outcome: "unavailable",
+			enabled: false,
+			active: false,
+			advisors: ["Unavailable"],
+		});
+	});
+
+	it("rejects scoped lifecycle changes that would replace active advisors outside the scope", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start the configured review roster",
+				idempotencyKey: "enable-roster",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+		const activeGeneration = session.getAdvisorStatus().generation;
+
+		expect(
+			session.ensureAdvisor({
+				enabled: false,
+				reason: "stop one review role",
+				idempotencyKey: "disable-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", generation: activeGeneration });
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: activeGeneration,
+			advisors: [
+				{ name: "Security", active: true },
+				{ name: "Architecture", active: true },
+			],
+		});
+
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		const architectureOnlyGeneration = session.getAdvisorStatus().generation;
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start a second review role",
+				idempotencyKey: "enable-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", generation: architectureOnlyGeneration });
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: architectureOnlyGeneration,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: true },
+			],
+		});
+	});
+
+	it("disabling the sole active scoped Advisor does not resurrect configured entries", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start the review roster",
+				idempotencyKey: "enable-roster-for-scoped-disable",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+
+		session.applyAdvisorConfigs(
+			[{ name: "Security" }, { name: "Architecture", model: "missing/advisor-model" }],
+			undefined,
+		);
+		expect(session.getAdvisorStatus()).toMatchObject({
+			advisors: [
+				{ name: "Security", active: true },
+				{ name: "Architecture", active: false },
+			],
+		});
+
+		const disabled = session.ensureAdvisor({
+			enabled: false,
+			reason: "policy review complete",
+			idempotencyKey: "disable-sole-active-scoped-advisor",
+			advisor: "Security",
+		});
+		expect(disabled).toMatchObject({ outcome: "disabled", enabled: false, active: false });
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: false, active: false });
+	});
+
+	it("refreshes only active advisors and preserves disabled roster entries", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start active review roles",
+				idempotencyKey: "start-active-roster",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+		session.applyAdvisorConfigs(
+			[{ name: "Security" }, { name: "Architecture" }, { name: "Audit", enabled: false }],
+			undefined,
+		);
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Architecture", active: true },
+			{ name: "Audit", active: false },
+		]);
+
+		const refreshed = session.ensureAdvisor({
+			enabled: true,
+			reason: "refresh active review roles",
+			idempotencyKey: "refresh-active-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(refreshed).toMatchObject({
+			outcome: "unchanged",
+			resetApplied: true,
+			advisors: ["Security", "Architecture"],
+		});
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Architecture", active: true },
+			{ name: "Audit", active: false },
+		]);
+	});
+
+	it("preserves disabled roster entries when activating from no live runtime", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Audit", enabled: false }], undefined);
+
+		const enabled = session.ensureAdvisor({
+			enabled: true,
+			reason: "start configured review roles",
+			idempotencyKey: "start-configured-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(enabled).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Audit", active: false },
+		]);
+	});
+
+	it("rejects unnamed activation when every configured advisor is disabled", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs(
+			[
+				{ name: "Security", enabled: false },
+				{ name: "Audit", enabled: false },
+			],
+			undefined,
+		);
+
+		const unavailable = session.ensureAdvisor({
+			enabled: true,
+			reason: "start configured review roles",
+			idempotencyKey: "start-empty-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(unavailable).toMatchObject({ outcome: "unavailable", active: false, advisors: [] });
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: false, active: false });
+	});
+
+	it("clears the lifecycle baseline when configs replace roster overrides", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const configs = [{ name: "Security", enabled: false }, { name: "Architecture" }];
+		session.applyAdvisorConfigs(configs, undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary security review",
+				idempotencyKey: "temporary-security-before-config",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+
+		session.applyAdvisorConfigs(configs, undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: false,
+				reason: "new lifecycle baseline after config",
+				idempotencyKey: "disable-after-config",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "disabled", active: false });
+		expect(await session.newSession()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: true, active: true });
+	});
+
+	it("clears lifecycle roster overrides at a conversation boundary", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary security review",
+				idempotencyKey: "temporary-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+
+		expect(await session.newSession()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({
+			enabled: false,
+			active: false,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: false },
+			],
+		});
+	});
+
+	it("clears lifecycle roster overrides when forking a conversation", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary fork review",
+				idempotencyKey: "temporary-fork-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+
+		expect(await session.fork()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({
+			enabled: false,
+			active: false,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: false },
+			],
+		});
+	});
+
+	it("clears lifecycle request dedupe at a conversation reset", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const request = {
+			enabled: true,
+			reason: "review this conversation",
+			idempotencyKey: "conversation-review",
+		} as const;
+		expect(session.ensureAdvisor(request).idempotent).toBe(false);
+		expect(session.ensureAdvisor(request).idempotent).toBe(true);
+
+		expect(await session.newSession()).toBe(true);
+		const afterReset = session.ensureAdvisor(request);
+
+		expect(afterReset).toMatchObject({ outcome: "enabled", idempotent: false, active: true });
+	});
 
 	it("keeps sessions isolated when sharing a Settings instance", async () => {
 		const sharedSettings = Settings.isolated({ "compaction.enabled": false });

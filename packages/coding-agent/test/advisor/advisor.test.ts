@@ -3993,6 +3993,46 @@ describe("advisor", () => {
 			expect(resetCount).toBe(1);
 		});
 
+		it("refreshes private context at the current cursor without replaying primary history", async () => {
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let resetCount = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+				},
+				abort: () => {},
+				reset: () => {
+					resetCount++;
+					state.messages.length = 0;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "ancient-primary", timestamp: 1 } as AgentMessage,
+				{ role: "user", content: "current-before-refresh", timestamp: 2 } as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+			});
+			runtime.seedTo(messages.length);
+
+			messages.push({ role: "user", content: "reviewed-before-refresh", timestamp: 3 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 1 && runtime.backlog === 0);
+
+			runtime.refreshContext(messages.length, "extension-context-refresh");
+			messages.push({ role: "user", content: "only-after-refresh", timestamp: 4 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 2 && runtime.backlog === 0);
+
+			expect(resetCount).toBe(1);
+			expect(promptText(promptInputs[1])).toContain("only-after-refresh");
+			expect(promptText(promptInputs[1])).not.toContain("ancient-primary");
+			expect(promptText(promptInputs[1])).not.toContain("current-before-refresh");
+			expect(promptText(promptInputs[1])).not.toContain("reviewed-before-refresh");
+		});
+
 		it("re-renders a queued primary context before its maintenance budget after overflow resets advisor context", async () => {
 			const overflowMessage = "context_length_exceeded: Your input exceeds the context window of this model.";
 			const firstOverflowPromptStarted = Promise.withResolvers<void>();

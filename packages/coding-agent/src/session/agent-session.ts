@@ -433,6 +433,7 @@ import {
 } from "./queued-messages";
 import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } from "./reset-fence";
 import type { ServingModel } from "./retry-fallback-chains";
+import type { AdvisorStatus, EnsureAdvisorRequest, EnsureAdvisorResult } from "../advisor/control";
 import {
 	type AdvisorCatchupOptions,
 	type AdvisorStats,
@@ -11117,6 +11118,7 @@ export class AgentSession implements SettingsScope {
 			this.#adoptInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
+			this.#advisors.resetLifecycleControlsForFork();
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
 			await this.#memory.resetContextForNewTranscript();
@@ -14646,6 +14648,16 @@ export class AgentSession implements SettingsScope {
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
 		return this.#advisors.setAdvisorEnabled(enabled);
+	}
+
+	/** Return the content-free Advisor lifecycle and usage status for extensions. */
+	getAdvisorStatus(): AdvisorStatus {
+		return this.#advisors.getAdvisorStatus();
+	}
+
+	/** Apply a deterministic Advisor lifecycle request for extensions. */
+	ensureAdvisor(request: EnsureAdvisorRequest): EnsureAdvisorResult {
+		return this.#advisors.ensureAdvisor(request);
 	}
 
 	/**
