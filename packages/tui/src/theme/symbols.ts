@@ -481,7 +481,6 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.advisorClosed": "🙈",
 	"icon.time": "⏱",
 	"icon.omp": "◆",
-	"icon.esc": "⎋",
 	"icon.ghost": "👻",
 	"icon.agents": "👥",
 	"icon.job": "⚙",
@@ -863,8 +862,6 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.time": "\uf017",
 	// Diamat mark: a compact, single-cell faceted diamond.
 	"icon.omp": "◆",
-	// pick: 󱊷 (nf-md-keyboard_esc) | alt: ⎋
-	"icon.esc": "\u{f12b7}",
 	// pick: 󰊠 (nf-md-ghost) | alt: 👻
 	"icon.ghost": "\u{f02a0}",
 	// pick:  | alt: 
@@ -1266,7 +1263,6 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.advisorClosed": "(adv)",
 	"icon.time": "t:",
 	"icon.omp": "D",
-	"icon.esc": "esc",
 	"icon.ghost": "@",
 	"icon.agents": "AG",
 	"icon.job": "bg",
