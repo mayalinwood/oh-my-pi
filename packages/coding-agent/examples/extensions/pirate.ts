@@ -11,6 +11,8 @@
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+export const capabilities = [{ kind: "ui:command" }, { kind: "events:subscribe" }];
+
 export default function pirateExtension(pi: ExtensionAPI) {
 	let pirateMode = false;
 

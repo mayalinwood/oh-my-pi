@@ -94,7 +94,7 @@ void withHostGuard(async () => {
 		);
 		const goodExtension = writeModule(
 			"good-extension.ts",
-			"export default function(pi) { pi.registerCommand('ok', { handler: async () => {} }); }\n",
+			"export const capabilities = [{ kind: 'ui:command' }];\nexport default function(pi) { pi.registerCommand('ok', { handler: async () => {} }); }\n",
 		);
 		const topLevelHook = writeModule("top-level-exit-hook.ts", "process.exit(42)\n");
 		const factoryHook = writeModule("factory-exit-hook.ts", "export default function(pi) { process.exit(32); }\n");

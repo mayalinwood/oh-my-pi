@@ -25,7 +25,8 @@ beforeEach(async () => {
 	const extensionPath = tmp.join("provider.ts");
 	await Bun.write(
 		extensionPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider("${PROVIDER}", {
 		baseUrl: "https://example.invalid/v1",
 		apiKey: "fixture-key",

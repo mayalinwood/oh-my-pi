@@ -402,7 +402,8 @@ describe("ACP lazy startup", () => {
 
 		await Bun.write(
 			path.join(cwd, "runtime-provider.ts"),
-			`export default function(pi) {
+			`export const capabilities = [{ kind: 'provider:register' }];
+export default function(pi) {
 	pi.registerProvider("runtime-provider", {
 		baseUrl: "https://runtime.example.com/v1",
 		apiKey: "extension-key",

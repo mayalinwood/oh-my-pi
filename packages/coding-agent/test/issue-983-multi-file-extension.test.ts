@@ -40,7 +40,7 @@ describe("issue #983: multi-file legacy Pi extensions", () => {
 			[
 				'import { foo } from "./helper.ts";',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'tools:register' }]; export default function(pi) {",
 				"\tconst { Type } = pi.typebox;",
 				"\tpi.registerTool({",
 				"\t\tname: foo,",

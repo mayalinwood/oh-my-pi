@@ -24,6 +24,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const DEFERRED_TOOL_EXTENSION = (logPath: string) => `
 	import * as fs from "node:fs";
+	export const capabilities = [{ kind: "host:sdk" }, { kind: "tools:register" }, { kind: "events:subscribe" }];
 	export default function(pi) {
 		const { Type } = pi.typebox;
 		pi.registerTool({
@@ -60,7 +61,7 @@ describe("startup-deferred extensions", () => {
 		fs.writeFileSync(toolOnly, DEFERRED_TOOL_EXTENSION(path.join(tempDir.path(), "unused.log")));
 		fs.writeFileSync(
 			withShortcut,
-			`export default function(pi) { pi.registerShortcut("ctrl+shift+y", { handler: () => {} }); }`,
+			`export const capabilities = [{ kind: "ui:shortcut" }]; export default function(pi) { pi.registerShortcut("ctrl+shift+y", { handler: () => {} }); }`,
 		);
 		fs.writeFileSync(neverLoaded, `export default function() {}`);
 
@@ -88,6 +89,7 @@ describe("startup-deferred extensions", () => {
 		fs.writeFileSync(
 			eagerPath,
 			`import * as fs from "node:fs";
+			export const capabilities = [{ kind: "events:subscribe" }];
 			export default function(pi) {
 				pi.on("session_start", () => { fs.appendFileSync(${JSON.stringify(logPath)}, "eager\\n"); });
 			}`,

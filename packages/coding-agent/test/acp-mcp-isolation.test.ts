@@ -117,7 +117,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			);
 			await Bun.write(
 				trustedPath,
-				`import { writeFileSync } from "node:fs"; export default function (pi) { pi.events.on("acp-session-live", () => writeFileSync(${JSON.stringify(firedPath)}, "fired")); }`,
+				`import { writeFileSync } from "node:fs"; export const capabilities = [{ kind: 'events:emit' }]; export default function (pi) { pi.events.on("acp-session-live", () => writeFileSync(${JSON.stringify(firedPath)}, "fired")); }`,
 			);
 			let captured: CreateAgentSessionOptions | undefined;
 			const fakeSession = {} as AgentSession;

@@ -31,6 +31,7 @@ describe("loadExtensions per-session binding (#2190 review fix)", () => {
 		await fs.writeFile(
 			extPath,
 			[
+				"export const capabilities = [{ kind: 'events:emit' }, { kind: 'tools:register' }];",
 				"export default function (api) {",
 				"  api.registerTool({",
 				"    name: 'tag',",

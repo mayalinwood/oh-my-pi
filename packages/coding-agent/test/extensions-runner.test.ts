@@ -217,6 +217,7 @@ describe("ExtensionRunner", () => {
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+c", {
 						description: "Conflicts with built-in",
@@ -246,6 +247,7 @@ describe("ExtensionRunner", () => {
 
 		it("rejects ctrl+q so it cannot shadow the app.message.followUp default (#1903)", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+q", {
 						description: "Tries to bind the follow-up chord",
@@ -279,6 +281,7 @@ describe("ExtensionRunner", () => {
 
 		it("rejects Alt+M so it cannot shadow the app.model.select default", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("alt+m", {
 						description: "Tries to bind model select",
@@ -309,6 +312,7 @@ describe("ExtensionRunner", () => {
 		it("warns when two extensions register same shortcut", async () => {
 			// Use a non-reserved shortcut
 			const extCode1 = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+shift+x", {
 						description: "First extension",
@@ -317,6 +321,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+shift+x", {
 						description: "Second extension",
@@ -350,6 +355,7 @@ describe("ExtensionRunner", () => {
 	describe("tool collection", () => {
 		it("collects tools from multiple extensions", async () => {
 			const toolCode = (name: string) => `
+				export const capabilities = [{ kind: 'tools:register' }];
 				export default function(pi) {
 					const { Type } = pi.typebox;
 					pi.registerTool({
@@ -382,6 +388,7 @@ describe("ExtensionRunner", () => {
 	describe("command collection", () => {
 		it("collects commands from multiple extensions", async () => {
 			const cmdCode = (name: string) => `
+				export const capabilities = [{ kind: 'ui:command' }];
 				export default function(pi) {
 					pi.registerCommand("${name}", {
 						description: "Test command",
@@ -408,6 +415,7 @@ describe("ExtensionRunner", () => {
 
 		it("prefers later-loaded explicit extensions for conflicting commands", async () => {
 			const deployCommand = (description: string) => `
+				export const capabilities = [{ kind: 'ui:command' }];
 				export default function(pi) {
 					pi.registerCommand("deploy", {
 						description: "${description}",
@@ -441,6 +449,7 @@ describe("ExtensionRunner", () => {
 	describe("error handling", () => {
 		it("rejects instead of returning untransformed context when its caller aborts a pending handler", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("context", async () => {
 						await new Promise(() => {});
@@ -466,6 +475,7 @@ describe("ExtensionRunner", () => {
 
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("context", async () => {
 						throw new Error("Handler error!");
@@ -500,6 +510,7 @@ describe("ExtensionRunner", () => {
 	describe("message renderers", () => {
 		it("gets message renderer by type", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:message-renderer' }];
 				export default function(pi) {
 					pi.registerMessageRenderer("my-type", (message, options, theme) => null);
 				}
@@ -524,6 +535,7 @@ describe("ExtensionRunner", () => {
 
 		it("collects assistant thinking renderers", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:thinking-renderer' }];
 				export default function(pi) {
 					pi.registerAssistantThinkingRenderer((context, theme) => null);
 				}
@@ -546,6 +558,7 @@ describe("ExtensionRunner", () => {
 	describe("flags", () => {
 		it("collects flags from extensions", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:flag' }];
 				export default function(pi) {
 					pi.registerFlag("--my-flag", {
 						description: "My flag",
@@ -849,6 +862,7 @@ describe("ExtensionRunner", () => {
 			if (!primaryModel || !requestModel) throw new Error("Expected bundled cross-provider models to exist");
 
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'model:read' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (_event, ctx) => {
 						const current = ctx.models.current();
@@ -917,6 +931,7 @@ describe("ExtensionRunner", () => {
 
 		it("chains payload replacements across handlers in load order", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { chain?: string[] };
@@ -925,6 +940,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { chain?: string[] };
@@ -950,6 +966,7 @@ describe("ExtensionRunner", () => {
 
 		it("keeps chaining after handler errors", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async () => {
 						throw new Error("payload failed");
@@ -957,6 +974,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { preserved?: boolean };
@@ -994,6 +1012,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 			import * as fs from "node:fs";
 
+			export const capabilities = [{ kind: 'events:subscribe' }];
 			export default function(pi) {
 				pi.on("after_provider_response", async (event) => {
 					fs.appendFileSync(
@@ -1069,6 +1088,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'model:read' }];
 				export default function(pi) {
 					pi.on("after_provider_response", async (_event, ctx) => {
 						const current = ctx.models.current();
@@ -1141,6 +1161,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 			import * as fs from "node:fs";
 
+			export const capabilities = [{ kind: 'events:subscribe' }];
 			export default function(pi) {
 				pi.on("session_stop", async (event) => {
 					fs.appendFileSync(
@@ -1223,6 +1244,7 @@ describe("ExtensionRunner", () => {
 				`
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_stop", async () => {
 						fs.writeFileSync(${JSON.stringify(startedPath)}, "started");
@@ -1295,6 +1317,7 @@ describe("ExtensionRunner", () => {
 			await Bun.write(
 				extensionPath,
 				`
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:abort' }];
 				export default function(pi) {
 					pi.on("session_stop", async (_event, ctx) => {
 						ctx.abort();
@@ -1369,6 +1392,7 @@ describe("ExtensionRunner", () => {
 			await Bun.write(
 				path.join(extensionsDir, "session-stop-precedence.ts"),
 				`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_stop", async () => ({ continue: true, additionalContext: "Earlier advisory." }));
 					pi.on("session_stop", async () => ({ decision: "block", reason: "Continue from second handler." }));
@@ -1419,6 +1443,7 @@ describe("ExtensionRunner", () => {
 	describe("tool_result chaining", () => {
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) => {
 						return {
@@ -1428,6 +1453,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) => {
 						return {
@@ -1472,6 +1498,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves previous modifications when later handlers return partial patches", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async () => {
 						return {
@@ -1482,6 +1509,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async () => {
 						return {
@@ -1566,6 +1594,7 @@ describe("ExtensionRunner", () => {
 
 		it("surfaces replacement content while keeping the call an error", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
@@ -1586,6 +1615,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves the original exception when no handler modifies the result", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", () => {});
 				}
@@ -1598,6 +1628,7 @@ describe("ExtensionRunner", () => {
 
 		it("converts a failure to success when a handler clears isError", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
@@ -1613,6 +1644,7 @@ describe("ExtensionRunner", () => {
 
 		it("marks a successful result as an error when a handler sets isError", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", () => ({
 						content: [{ type: "text", text: "now failing" }],
@@ -1628,6 +1660,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves a tool-reported error through extension rewrites", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => ({
 						content: [{ type: "text", text: event.isError ? "observed failure" : "observed success" }],
@@ -1681,6 +1714,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				hangExtensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("session_start", async () => {
 							await Promise.withResolvers().promise;
@@ -1693,6 +1727,7 @@ describe("ExtensionRunner", () => {
 				`
 					import * as fs from "node:fs";
 
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("session_start", async () => {
 							fs.appendFileSync(${JSON.stringify(markerPath)}, "fast\\n");
@@ -1744,6 +1779,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						pi.on("session_shutdown", () => {
 							const { Type } = pi.typebox;
@@ -1792,6 +1828,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				hangExtensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async () => {
 							await Promise.withResolvers().promise;
@@ -1861,6 +1898,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async () => {
 							await Promise.withResolvers().promise;
@@ -1927,6 +1965,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						pi.on("tool_call", () => {
 							const { Type } = pi.typebox;
@@ -1990,6 +2029,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						const { Type } = pi.typebox;
 						pi.registerTool({
@@ -2040,6 +2080,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							ctx.ui.notify("Waiting for confirmation");
@@ -2152,6 +2193,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							await ctx.ui.custom(async () => {
@@ -2222,6 +2264,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							await ctx.ui.confirm("High-risk command", "Allow this command?");
@@ -2286,6 +2329,7 @@ describe("ExtensionRunner", () => {
 	describe("memory context", () => {
 		it("exposes the lazy memory runtime after initialization", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_start", async (_event, ctx) => {
 						globalThis.__ompMemoryStatus = await ctx.memory.status();
@@ -2357,6 +2401,7 @@ describe("ExtensionRunner", () => {
 	describe("service tier API", () => {
 		it("returns a detached snapshot, forwards valid changes, and rejects invalid family tiers", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:append' }, { kind: 'model:read' }, { kind: 'model:write' }];
 				export default function(pi) {
 					pi.on("session_start", () => {
 						const tiers = pi.getServiceTiers();
@@ -2440,6 +2485,7 @@ describe("ExtensionRunner", () => {
 
 	describe("extension settings section API", () => {
 		const extensionSource = `
+			export const capabilities = [{ kind: 'settings:register' }];
 			export default function(pi) {
 				const fields = [
 					{ key: "enabled", label: "Enabled", description: "Enable review.", type: "boolean", default: true },
@@ -2660,6 +2706,7 @@ describe("ExtensionRunner", () => {
 	describe("advisor lifecycle API", () => {
 		it("delegates content-free status and control requests through the loaded extension API", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'advisor:read' }, { kind: 'advisor:lease' }];
 				export default function(pi) {
 					pi.on("session_start", () => {
 						globalThis.__advisorLifecycleApi = {
@@ -2790,7 +2837,10 @@ describe("ExtensionRunner", () => {
 
 		it("keeps Advisor actions unavailable during extension load", async () => {
 			const explicitExtensionPath = path.join(tempDir.path(), "advisor-lifecycle-load.ts");
-			fs.writeFileSync(explicitExtensionPath, `export default function(pi) { pi.getAdvisorStatus(); }`);
+			fs.writeFileSync(
+				explicitExtensionPath,
+				`export const capabilities = [{ kind: 'advisor:read' }]; export default function(pi) { pi.getAdvisorStatus(); }`,
+			);
 
 			const result = await loadTestExtensions([explicitExtensionPath]);
 			const loadError = result.errors.find(error => error.path.includes("advisor-lifecycle-load.ts"));
@@ -2802,6 +2852,7 @@ describe("ExtensionRunner", () => {
 	describe("session name API", () => {
 		it("lets extensions read and set the session name after initialization", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:read' }, { kind: 'session:write' }];
 				export default function(pi) {
 					pi.on("session_start", async () => {
 						if (pi.getSessionName() !== undefined) {
@@ -2860,6 +2911,7 @@ describe("ExtensionRunner", () => {
 
 		it("keeps session naming unavailable during extension load", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'session:read' }];
 				export default function(pi) {
 					pi.getSessionName();
 				}
@@ -2951,6 +3003,7 @@ describe("ExtensionRunner", () => {
 		it("emits requested before waiting and resolved after approval", async () => {
 			const events: Array<{ type: string; approved?: boolean }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__approvalEvents.push({ type: event.type });
@@ -3158,6 +3211,7 @@ describe("ExtensionRunner", () => {
 		it("emits resolved false when approval is denied", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__deniedApprovalEvents.push({ type: event.type, reason: event.reason });
@@ -3207,6 +3261,7 @@ describe("ExtensionRunner", () => {
 		it("emits resolved false when the approval prompt throws", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__thrownApprovalEvents.push({ type: event.type, reason: event.reason });
@@ -3258,6 +3313,7 @@ describe("ExtensionRunner", () => {
 		it("emits lifecycle events when partial context has no session manager", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string; sessionId?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__partialContextApprovalEvents.push({
@@ -3331,6 +3387,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3395,6 +3452,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3434,6 +3492,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3474,6 +3533,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3536,6 +3596,7 @@ describe("ExtensionRunner", () => {
 		it("executes the tool with a non-blocking handler's replacement input", async () => {
 			const recordPath = path.join(tempDir.path(), "override-executed.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3575,6 +3636,7 @@ describe("ExtensionRunner", () => {
 		it("ignores a replacement input when the handler also blocks", async () => {
 			const recordPath = path.join(tempDir.path(), "override-blocked.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3666,6 +3728,7 @@ describe("ExtensionRunner", () => {
 		it("blocks a revised input that resolves to a deny policy (approval gates the revised args)", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-blocked.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3697,6 +3760,7 @@ describe("ExtensionRunner", () => {
 		it("allows a revised input that still passes policy", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-allowed.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3729,6 +3793,7 @@ describe("ExtensionRunner", () => {
 		it("uses the last handler's input when several handlers set it", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-multi.jsonl");
 			const first = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3737,6 +3802,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3770,6 +3836,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves distinct additional context from every non-blocking handler in registration order", async () => {
 			const first = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({
 						input: { command: "echo first" },
@@ -3779,6 +3846,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "second context" }));
 					pi.on("tool_call", async () => ({ additionalContext: "first context" }));
@@ -3942,6 +4010,7 @@ describe("ExtensionRunner", () => {
 
 		it("forwards passive context from wrapper-dispatched calls through the tool context", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "nested device context" }));
 				}
@@ -3974,6 +4043,7 @@ describe("ExtensionRunner", () => {
 
 		it("discards collected additional context when a later handler blocks", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "must not leak" }));
 					pi.on("tool_call", async () => ({ block: true, reason: "blocked" }));
@@ -4005,6 +4075,7 @@ describe("ExtensionRunner", () => {
 			// approval gate. Forwarding waits for approval: an approved call
 			// delivers, a denied call throws before anything is injected.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -4074,6 +4145,7 @@ describe("ExtensionRunner", () => {
 			// on policy alone would let the revised args run under approval granted for the original.
 			// Because tool_call fires before the approval gate, the prompt must reflect the revised args.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -4136,6 +4208,7 @@ describe("ExtensionRunner", () => {
 			// still emits.
 			const recordPath = path.join(tempDir.path(), "loop-marker.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -4175,6 +4248,7 @@ describe("ExtensionRunner", () => {
 			// (here: no interactive UI => reject) instead of riding the outer approval.
 			const recordPath = path.join(tempDir.path(), "xdev-revised.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -4210,6 +4284,7 @@ describe("ExtensionRunner", () => {
 		] as const)("forfeits ACP approval after in-place input mutation %s", async (_case, returnsInput) => {
 			const recordPath = path.join(tempDir.path(), `acp-mutated-${returnsInput}.jsonl`);
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -4243,6 +4318,7 @@ describe("ExtensionRunner", () => {
 		it("reports the effective tier after a tool_call handler revises xd:// input", async () => {
 			const recordPath = path.join(tempDir.path(), "xdev-effective-tier.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -4287,6 +4363,7 @@ describe("ExtensionRunner", () => {
 		it("emits tool_call before the approval prompt so approval sees the final input", async () => {
 			const order: string[] = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -4342,6 +4419,7 @@ describe("ExtensionRunner", () => {
 	describe("hasHandlers", () => {
 		it("returns true when handlers exist for event type", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => undefined);
 				}
@@ -4368,6 +4446,7 @@ describe("ExtensionRunner", () => {
 			// streaming events (message_update / tool_execution_*) traverse the same
 			// path. `turn_start` stands in as a subscribed event with a trivial payload.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("turn_start", async () => {
 						throw new Error("turn_start handler ran");
@@ -4416,6 +4495,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4455,6 +4535,7 @@ describe("ExtensionRunner", () => {
 		it("isolates subscriber failures so other handlers still receive the event", async () => {
 			const eventsPath = path.join(tempDir.path(), "credential-disabled-isolated.jsonl");
 			const ext1Code = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async () => {
 						throw new Error("subscriber exploded");
@@ -4464,6 +4545,7 @@ describe("ExtensionRunner", () => {
 			const ext2Code = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4507,6 +4589,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4580,6 +4663,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("mcp_notification", async (event) => {
 						fs.appendFileSync(
@@ -4665,6 +4749,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("mcp_notification", async (event) => {
 						fs.appendFileSync(
@@ -4978,6 +5063,7 @@ describe("ExtensionRunner", () => {
 	describe("context prompt caching", () => {
 		it("anchors Anthropic rolling breakpoints on persisted history behind injected messages", async () => {
 			const extensionCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					const name = import.meta.path.endsWith("inject-a.ts") ? "a" : "b";
 					pi.on("context", async event => ({

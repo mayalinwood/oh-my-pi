@@ -2888,6 +2888,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						resolvedPath: sourceId,
 						factory,
 						error: null,
+						// Host-constructed: rebinding into a child session must not
+						// silently drop to deny-all.
+						trusted: true,
 					});
 				}
 			}

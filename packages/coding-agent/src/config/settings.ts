@@ -32,6 +32,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { isLightTheme } from "@oh-my-pi/pi-tui/theme/theme";
+import type { ExtensionSettingProvenance } from "@oh-my-pi/pi-tui/overlays/extension-settings-types";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
@@ -290,6 +291,14 @@ function assertKnownSettingPaths(layer: RawSettings, prefix = ""): void {
 	for (const key in layer) {
 		const id = prefix ? `${prefix}.${key}` : key;
 		if (lookupSetting(id)) continue;
+		// Extension settings are host-owned but not registry-backed, so a layer may address the
+		// reserved namespace directly. Shape is checked by the extension settings id/key patterns.
+		if (id.startsWith("extensionSettings.")) {
+			const segments = id.split(".");
+			assertExtensionSettingsPath(segments[1], segments[2]);
+			if (segments.length > 3) throw new Error(`Unknown setting "${id}"`);
+			continue;
+		}
 		const value = layer[key];
 		if (!isRecord(value)) throw new Error(`Unknown setting "${id}"`);
 		assertKnownSettingPaths(value, id);
@@ -901,8 +910,27 @@ export class Settings {
 	}
 
 	/**
+	 * Layer supplying one extension setting's effective value, in the same precedence order as
+	 * {@link getProvenance}: runtime override → config overlay → project → global → schema default.
+	 * Extension settings are not registered {@link AnySetting} descriptors, so the layers are
+	 * consulted directly instead of through a settings descriptor.
+	 */
+	getExtensionSettingsProvenance(sectionId: string, key: string): ExtensionSettingProvenance {
+		assertExtensionSettingsPath(sectionId, key);
+		const segments = ["extensionSettings", sectionId, key];
+		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
+		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
+		if (getByPath(this.#project, segments) !== undefined) return "project";
+		if (getByPath(this.#global, segments) !== undefined) return "global";
+		return "default";
+	}
+
+	/**
 	 * Persist one validated extension setting in the native project config.
 	 * Extension startup snapshots intentionally remain detached from this layer.
+	 *
+	 * Fails closed when a runtime override or config overlay already supplies the value: an
+	 * on-disk project config must never silently shadow a decision made for the live session.
 	 */
 	setProjectExtensionSetting(sectionId: string, key: string, value: boolean | number | string): void {
 		assertExtensionSettingsPath(sectionId, key);
@@ -912,10 +940,37 @@ export class Settings {
 		) {
 			throw new TypeError("Extension setting values must be booleans, finite numbers, or text");
 		}
+		const pinned = this.getExtensionSettingsProvenance(sectionId, key);
+		if (pinned === "runtime" || pinned === "overlay") {
+			throw new Error(
+				`Extension setting "${sectionId}.${key}" is supplied by the ${pinned} layer and cannot be overridden at project scope`,
+			);
+		}
 		setByPath(this.#project, ["extensionSettings", sectionId, key], value);
 		const modifiedKeys = this.#modifiedProjectExtensionSettings.get(sectionId) ?? new Set<string>();
 		modifiedKeys.add(key);
 		this.#modifiedProjectExtensionSettings.set(sectionId, modifiedKeys);
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#queueProjectSave();
+	}
+
+	/**
+	 * Clear the project-layer value of one extension setting so the next launch falls back to the
+	 * next layer that supplies it, or to the extension's declared default. Fails closed for the
+	 * same reason as {@link setProjectExtensionSetting}.
+	 */
+	resetExtensionSetting(sectionId: string, key: string): void {
+		assertExtensionSettingsPath(sectionId, key);
+		const pinned = this.getExtensionSettingsProvenance(sectionId, key);
+		if (pinned === "runtime" || pinned === "overlay") {
+			throw new Error(
+				`Extension setting "${sectionId}.${key}" is supplied by the ${pinned} layer and cannot be reset at project scope`,
+			);
+		}
+		if (getByPath(this.#project, ["extensionSettings", sectionId, key]) === undefined) return;
+		deleteByPath(this.#project, ["extensionSettings", sectionId, key]);
+		this.#modifiedProjectExtensionSettings.get(sectionId)?.delete(key);
 		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueProjectSave();

@@ -161,6 +161,7 @@ describe("extension autocomplete provider API (#4919)", () => {
 		fs.writeFileSync(
 			extPath,
 			`import * as fs from "node:fs";
+export const capabilities = [{ kind: 'events:subscribe' }];
 export default function (pi) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {

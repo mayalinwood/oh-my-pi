@@ -21,6 +21,14 @@ An extension is a TS/JS module exporting a default factory. Factories may initia
 ```ts
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+// One kind per host power the factory reaches for.
+export const capabilities = [
+  { kind: "events:subscribe" },
+  { kind: "tools:register" },
+  { kind: "ui:command" },
+  { kind: "ui:message-renderer" },
+];
+
 export default function myExtension(pi: ExtensionAPI) {
   // register handlers/tools/commands/renderers
 }
@@ -34,6 +42,8 @@ Extensions can combine all of the following in one module:
 - keyboard shortcuts and flags
 - custom message rendering
 - session/message injection APIs (`sendMessage`, `sendUserMessage`, `appendEntry`)
+
+Every item above is a declared capability — see [Declaring capabilities](#declaring-capabilities).
 
 ## Runtime model
 
@@ -70,6 +80,13 @@ Important constraint from `loader.ts`:
 
 ```ts
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+export const capabilities = [
+  { kind: "ui:label" },
+  { kind: "events:subscribe" },
+  { kind: "tools:register" },
+  { kind: "ui:command" },
+];
 
 export default function (pi: ExtensionAPI) {
   const z = pi.zod;
@@ -109,11 +126,104 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
+## Declaring capabilities
+
+An extension loaded from a path is gated. It declares the host powers it needs by
+exporting `capabilities` next to its factory:
+
+```ts
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+export const capabilities = [
+  { kind: "events:subscribe" },
+  { kind: "tools:register" },
+  { kind: "ui:command" },
+  { kind: "process:exec", command: "git", args: ["rev-parse", "--show-toplevel"] },
+];
+
+export default function (pi: ExtensionAPI) {
+  // only what was declared is reachable
+}
+```
+
+- The declaration **defaults to empty**. An extension that declares nothing reaches no
+  gated member; the grant is never inferred from what the factory does.
+- A `kind` this runtime does not implement is **not ignored** — the load fails with
+  `Extension declares capabilities this runtime does not implement: <kind>`.
+- Calling an undeclared member throws `ExtensionCapabilityDenied`, naming the member and
+  the kind it needed. Registration happens while the factory loads, so an undeclared
+  `register*` call fails the **load** with that name in its diagnostic
+  (`Failed to load extension: Extension "<path>" used "registerTool", which requires
+  the "tools:register" capability...`); an undeclared runtime action instead throws at
+  the call site, inside the handler that called it.
+- Grants bound *what an extension may reach*, not what a granted reach may do once inside
+  the process. Extensions are **not sandboxed** — see
+  [`extension-loading.md`](./extension-loading.md#runtime-isolation-model).
+- `loadExtensionFromFactory` is **not** gated. An inline factory is constructed by the
+  host, which already holds everything it passes on.
+- Hooks are **not** gated.
+- `process:exec` is checked per invocation, not once at load: `*` matches within a single
+  path segment, and a trailing `**` absorbs the remaining arguments for that command. A
+  grant for `git rev-parse` does not authorise `git push`, and a grant for `python3` does
+  not authorise `bash`.
+
+### Member → required capability
+
+The two tables below are the whole gated surface. A member absent from them is never
+privileged: `pi.zod`, `pi.arktype`, `pi.typebox`, `pi.pi`, `pi.logger`, `ctx.ui`, `ctx.cwd`,
+`ctx.hasUI`, `ctx.isIdle()`, `ctx.hasPendingMessages()`, `ctx.getContextUsage()`, the managed
+`ctx.setInterval`/`ctx.setTimeout`/`ctx.clearTimer` timers, and `ctx.memory`.
+
+`ExtensionAPI` (the factory's `pi`):
+
+| Member                                                                   | Kind                   |
+| ------------------------------------------------------------------------ | ---------------------- |
+| `on`                                                                     | `events:subscribe`     |
+| `events`                                                                 | `events:emit`          |
+| `registerTool`                                                           | `tools:register`       |
+| `registerFileWriteFallback`                                              | `fs:write`             |
+| `registerFileDeleteFallback`                                             | `fs:delete`            |
+| `registerSettingsSection`                                                | `settings:register`    |
+| `getFlag`                                                                | `flags:read`           |
+| `registerFlag`, `flagValues`                                             | `ui:flag`              |
+| `registerProvider`, `unregisterProvider`, `pendingProviderRegistrations` | `provider:register`    |
+| `registerCommand`                                                        | `ui:command`           |
+| `setLabel`                                                               | `ui:label`             |
+| `registerShortcut`                                                       | `ui:shortcut`          |
+| `registerMessageRenderer`                                                | `ui:message-renderer`  |
+| `registerAssistantThinkingRenderer`                                      | `ui:thinking-renderer` |
+| `registerComposerShape`                                                  | `ui:composer-shape`    |
+| `sendMessage`, `sendUserMessage`                                         | `session:message`      |
+| `appendEntry`                                                            | `session:append`       |
+| `exec`                                                                   | `process:exec`         |
+| `getActiveTools`, `getAllTools`, `getCommands`, `getSessionName`         | `session:read`         |
+| `setActiveTools`, `setSessionName`                                       | `session:write`        |
+| `getAdvisorStatus`                                                       | `advisor:read`         |
+| `ensureAdvisor`                                                          | `advisor:lease`        |
+| `getThinkingLevel`, `getServiceTiers`                                    | `model:read`           |
+| `setModel`, `setThinkingLevel`, `setServiceTier`                         | `model:write`          |
+| `pi`                                                                     | `host:sdk`             |
+
+Handler/tool context (`ctx`):
+
+| Member                                                            | Kind               |
+| ----------------------------------------------------------------- | ------------------ |
+| `compact`                                                         | `session:compact`  |
+| `abort`                                                           | `session:abort`    |
+| `shutdown`                                                        | `session:shutdown` |
+| `runEphemeralTurn`                                                | `session:turn`     |
+| `addAdditionalContext`                                            | `session:context`  |
+| `invokeTool`                                                      | `tools:invoke`     |
+| `sessionManager`, `getSystemPrompt`                               | `session:read`     |
+| `modelRegistry`                                                   | `model:registry`   |
+| `model`, `models`                                                 | `model:read`       |
+| `newSession`, `branch`, `navigateTree`, `switchSession`, `reload` | `session:write`    |
+
 ## Extension API surfaces
 
 ## 1) Registration and actions (`ExtensionAPI`)
 
-Core methods:
+Core methods — each is gated by its own kind, see [Declaring capabilities](#declaring-capabilities):
 
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`, `registerSettingsSection`
@@ -145,6 +255,8 @@ Call it while the extension factory is loading. The return value is a frozen,
 validated startup snapshot:
 
 ```ts
+export const capabilities = [{ kind: "settings:register" }];
+
 const policy = pi.registerSettingsSection({
   id: "review-policy",
   label: "Review policy",
@@ -239,6 +351,8 @@ cost. It never returns primary or Advisor transcript content.
 control:
 
 ```ts
+export const capabilities = [{ kind: "advisor:lease" }];
+
 const result = pi.ensureAdvisor({
   enabled: true,
   advisor: "Security", // omit only for a single-advisor roster
@@ -273,6 +387,8 @@ Extensions supporting older OMP releases must feature-detect both methods and
 fail closed; do not dispatch `/advisor` text or import session internals:
 
 ```ts
+export const capabilities = [{ kind: "advisor:read" }, { kind: "advisor:lease" }];
+
 if (typeof pi.getAdvisorStatus !== "function" || typeof pi.ensureAdvisor !== "function") {
   // Report unsupported and leave the primary session unchanged.
   return;
@@ -316,6 +432,8 @@ by the host's AuthStorage cache, history, and usage displays just like built-in 
 usage.
 
 ```ts
+export const capabilities = [{ kind: "provider:register" }];
+
 pi.registerProvider("my-provider", {
   baseUrl: "https://api.example.com/v1",
   api: "openai-completions",
@@ -522,6 +640,8 @@ Handlers and tool `execute` receive `ctx` with:
 Run the same side-turn pipeline as `/btw` using the current model and conversational context. The question and response are not appended to session history, and the request can run while the main turn is active. The snapshot may include in-flight assistant text.
 
 ```ts
+export const capabilities = [{ kind: "session:turn" }];
+
 if (!ctx.runEphemeralTurn) {
   throw new Error("This host does not support ephemeral turns");
 }
@@ -556,6 +676,8 @@ Use `ctx.setInterval` / `ctx.setTimeout` for any periodic or deferred background
 - are `unref`'d (never keep the process alive on their own) and are cleared automatically on `session_shutdown`.
 
 ```ts
+export const capabilities = [{ kind: "events:subscribe" }];
+
 pi.on("session_start", async (_event, ctx) => {
   const timer = ctx.setInterval(() => {
     // A throw here is contained — it will not crash the session.
@@ -578,6 +700,8 @@ If you use raw `setInterval`/`setTimeout` or detached promises instead, you own 
 - `family(model)` — an opaque lineage token for "same family?" checks (Claude point releases share a token; Claude and GPT differ). Compare it; don't persist it (the vocabulary tracks new releases).
 
 ```ts
+export const capabilities = [{ kind: "model:read" }];
+
 // Pick a model from a different family than the current one (e.g. a cross-family reviewer).
 const current = ctx.models.current();
 const contrasting = ctx.models
@@ -741,6 +865,8 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 Bridging a push-capable MCP into a session steer:
 
 ```ts
+export const capabilities = [{ kind: "events:subscribe" }, { kind: "session:message" }];
+
 pi.on("mcp_notification", (event) => {
   if (event.server !== "peer-bus") return;
   if (event.method !== "notifications/peer_message") return;
@@ -792,6 +918,8 @@ execute(
 A `tool_call` handler can return `additionalContext` without changing the tool result:
 
 ```ts
+export const capabilities = [{ kind: "events:subscribe" }];
+
 pi.on("tool_call", async event => {
   if (event.toolName === "search") {
     return { additionalContext: "Use this result before searching again." };
@@ -826,6 +954,8 @@ run the original instead of reimplementing it. When your registered tool shadows
 passed to `execute` carries:
 
 ```ts
+export const capabilities = [{ kind: "tools:invoke" }];
+
 ctx.invokeTool?<TDetails>(
   params: Record<string, unknown>,
   options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback },
@@ -841,9 +971,13 @@ present only when a native built-in of that name exists — `ctx.invokeTool` is 
 net-new tool that shadows no built-in. The native call is not re-gated, since it is the same tool you
 are already approved as, and delegation depth is guarded against accidental self-recursion.
 
+Reaching `ctx.invokeTool` at all requires declaring `tools:invoke`.
+
 Template:
 
 ```ts
+export const capabilities = [{ kind: "tools:register" }];
+
 const z = pi.zod;
 
 pi.registerTool({
@@ -900,6 +1034,8 @@ with a permission error (`EPERM`/`EACCES`/`EROFS` — every other error, such as
 via `pi.registerFileWriteFallback` before giving up:
 
 ```ts
+export const capabilities = [{ kind: "fs:write" }];
+
 import type { FileWriteFallbackHandler } from "@oh-my-pi/pi-coding-agent";
 
 const writeThroughBroker: FileWriteFallbackHandler = async (req, ctx) => {
@@ -970,6 +1106,8 @@ permission error from these surfaces as it does today, with no handler consulted
 Removing a file is a different primitive from writing one, and it has its own seam:
 
 ```ts
+export const capabilities = [{ kind: "fs:delete" }];
+
 pi.registerFileDeleteFallback(async (req, ctx) => {
   // req: { dst; cause; confirmedFile; sessionId } — no `content`.
   return await myPrivilegedWriter.unlink(req.dst);
@@ -1246,6 +1384,8 @@ For durable extension state:
 Example reconstruction pattern:
 
 ```ts
+export const capabilities = [{ kind: "events:subscribe" }, { kind: "session:read" }];
+
 pi.on("session_start", async (_event, ctx) => {
   let latest;
   for (const entry of ctx.sessionManager.getBranch()) {
@@ -1297,6 +1437,8 @@ no branch and **silently drops** the entry with no error or log, so a session ca
 off `role` loses every tool result while user/assistant text still flows through.
 
 ```ts
+export const capabilities = [{ kind: "session:read" }];
+
 for (const entry of ctx.sessionManager.getBranch()) {
   switch (entry.type) {
     case "custom_message":
@@ -1329,6 +1471,8 @@ for (const entry of ctx.sessionManager.getBranch()) {
 `registerComposerShape` adds an extension-owned input-editor layout to **Appearance → Composer Shape**. Register it from the extension factory; the renderer is used by the live editor and its settings preview.
 
 ```ts
+export const capabilities = [{ kind: "ui:composer-shape" }];
+
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ComposerStyle } from "@oh-my-pi/pi-tui";
 
@@ -1403,6 +1547,8 @@ The built-in implementations in `packages/tui/src/components/composer/` are the 
 ## Custom message renderer
 
 ```ts
+export const capabilities = [{ kind: "ui:message-renderer" }];
+
 pi.registerMessageRenderer("my-type", (message, { expanded }, theme) => {
   // return pi-tui Component
 });
@@ -1413,6 +1559,8 @@ Used by interactive rendering when custom messages are displayed.
 ## Assistant thinking renderer
 
 ```ts
+export const capabilities = [{ kind: "ui:thinking-renderer" }];
+
 import { Container, Text } from "@oh-my-pi/pi-tui";
 
 pi.registerAssistantThinkingRenderer((context, theme) => {
@@ -1433,6 +1581,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 ## Constraints and pitfalls
 
 - Session actions are unavailable during extension load; registration methods, `getFlag`, and `exec` are available.
+- Extensions loaded from a path reach only what they declare, and `capabilities` defaults to empty.
 - `tool_call` errors and timeouts block execution (fail-closed). Its budget is `extensionHandlers.toolCallTimeoutMs` (default 30,000 ms), paused during extension UI waits.
 - Most dispatched handlers have a 30-second budget; `session_shutdown` handlers run concurrently with a 2-second budget. Timing out stops waiting and cancels handler UI, but cannot undo arbitrary extension side effects.
 - Command name conflicts with built-ins are skipped with diagnostics.

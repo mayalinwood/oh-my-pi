@@ -206,6 +206,17 @@ function extractTodoItems(message: string): TodoItem[] {
 	return items;
 }
 
+export const capabilities = [
+	{ kind: "ui:flag" },
+	{ kind: "session:write" },
+	{ kind: "ui:command" },
+	{ kind: "ui:shortcut" },
+	{ kind: "events:subscribe" },
+	{ kind: "session:message" },
+	{ kind: "flags:read" },
+	{ kind: "session:append" },
+];
+
 export default function planModeExtension(pi: ExtensionAPI) {
 	let planModeEnabled = false;
 	let toolsCalledThisTurn = false;

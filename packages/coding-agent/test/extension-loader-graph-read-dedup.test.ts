@@ -72,6 +72,7 @@ describe("Extension Loader Graph Read Dedup", () => {
 
 		const entryPath = path.join(extDir, "index.ts");
 		const entryContent = `import "./mod-0.ts";
+export const capabilities = [{ kind: 'tools:register' }];
 export default function(pi) {
     const { Type } = pi.typebox;
     pi.registerTool({

@@ -10,7 +10,7 @@ import { initializeWithSettings, loadCapability } from "@oh-my-pi/pi-coding-agen
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
-const HOOK_SOURCE = `export default function(pi) {
+const HOOK_SOURCE = `export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 	pi.on("tool_call", async () => ({ block: true, reason: "blocked by hook" }));
 }`;
 

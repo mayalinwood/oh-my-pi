@@ -167,6 +167,7 @@ import type {
 	ExtensionAskDialogResult,
 	ExtensionAskDialogSubmitResult,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import type { ResolvedExtensionGrants } from "./capabilities";
 export type {
 	ExtensionAskDialogOption,
 	ExtensionAskDialogQuestion,
@@ -1623,6 +1624,7 @@ export interface RegisteredCommand {
 // single import path through the coding-agent surface.
 export type {
 	ExtensionSettingValue,
+	ExtensionSettingProvenance,
 	ExtensionBooleanSettingField,
 	ExtensionIntegerSettingField,
 	ExtensionNumberSettingField,
@@ -2278,6 +2280,12 @@ export interface Extension {
 	/** Set once the extension calls `registerProvider`; providers feed startup model resolution. */
 	registersProviders?: boolean;
 	settingsSections?: Map<string, RegisteredExtensionSettingsSection>;
+	/**
+	 * Capabilities this extension declared, already resolved and validated. An
+	 * extension with no declaration holds none, so the handler context it is
+	 * given exposes no privileged member.
+	 */
+	grants?: ResolvedExtensionGrants;
 }
 
 /**
@@ -2290,6 +2298,17 @@ export interface PreparedExtension {
 	resolvedPath: string;
 	factory: ExtensionFactory | null;
 	error: string | null;
+	/**
+	 * Capabilities the module declared. Absent means no grants at all, so an
+	 * extension that declares nothing reaches no privileged host member.
+	 */
+	capabilities?: unknown;
+	/**
+	 * Set when the host constructed this module itself (an inline factory).
+	 * The caller already holds everything it passes on, so rebinding it into a
+	 * child session must not silently drop to deny-all.
+	 */
+	trusted?: boolean;
 }
 
 /** Result of loading extensions. */

@@ -240,6 +240,10 @@ describe("registered extension settings", () => {
 				}
 				setCalls.push({ key, value });
 			},
+			provenanceOf: key => (key === "reviewer" ? "global" : "project"),
+			resetToDefault: key => {
+				delete values[key as keyof typeof values];
+			},
 			getStatus: () => [{ label: "Advisor status", value: "running", description: "Current identity." }],
 			isRestartRequired: () =>
 				values.maxCycles !== 12 || values.costCutoffUsd !== 1 || values.reviewer !== "automatic",

@@ -50,6 +50,7 @@ describe("extension loader host runtime binding", () => {
 		const extensionPath = writeModule(
 			"extension.ts",
 			`
+				export const capabilities = [{ kind: 'host:sdk' }, { kind: 'ui:command' }];
 				export default function(api) {
 					${identityGuard}
 					api.registerCommand("identity_extension", { handler: async () => {} });
@@ -88,6 +89,7 @@ describe("extension loader host runtime binding", () => {
 		const hookPath = writeModule(
 			"hook.ts",
 			`
+				export const capabilities = [{ kind: 'host:sdk' }, { kind: 'events:subscribe' }];
 				export default function(api) {
 					${identityGuard}
 					api.on("identity:event", async () => "ok");

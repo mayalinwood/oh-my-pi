@@ -7,6 +7,8 @@
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+export const capabilities = [{ kind: "ui:command" }, { kind: "tools:register" }, { kind: "session:message" }];
+
 export default function (pi: ExtensionAPI) {
 	const z = pi.zod;
 

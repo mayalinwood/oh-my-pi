@@ -329,7 +329,31 @@ not an extension sandbox. Existing per-module load-failure handling is unchanged
 
 ### Runtime isolation model
 
-- Extensions are **not sandboxed** (same process/runtime).
+- Extensions are **not sandboxed** (same process/runtime). Capability grants
+  bound *what an extension may reach*, not what a granted reach can do once
+  inside the process.
+- An extension loaded from a path declares the host powers it needs, by
+  exporting `capabilities` alongside its factory:
+
+  ```ts
+  export const capabilities = [
+    { kind: 'tools:register' },
+    { kind: 'process:exec', command: 'git', args: ['rev-parse', '--show-toplevel'] },
+  ];
+  ```
+
+  The declaration defaults to empty, so an extension that declares nothing
+  reaches no privileged member. A kind the runtime does not implement fails
+  the load closed rather than being ignored.
+- `process:exec` is matched per invocation, not once at load: `*` matches
+  within one path segment and a trailing `**` absorbs the remaining arguments
+  for that command. A grant for `git rev-parse` does not authorise `git push`,
+  and a grant for `python3` does not authorise `bash`.
+- A refused call throws `ExtensionCapabilityDenied` naming the missing grant,
+  rather than leaving the member absent, so the failure names its cause at the
+  call site.
+- `loadExtensionFromFactory` is not gated: an inline factory is constructed by
+  the host, which already holds everything it passes on.
 - They share one `EventBus` and one `ExtensionRuntime` instance.
 - During load, runtime action methods intentionally throw `ExtensionRuntimeNotInitializedError`; action wiring happens later in `ExtensionRunner.initialize()`.
 

@@ -9,6 +9,12 @@
 
 export type ExtensionSettingValue = boolean | number | string;
 
+/**
+ * Layer supplying an extension setting's effective value. Mirrors the host settings
+ * precedence order; the extension never chooses this.
+ */
+export type ExtensionSettingProvenance = "runtime" | "overlay" | "project" | "global" | "default";
+
 interface ExtensionSettingFieldBase<Key extends string = string> {
 	/** Stable YAML key stored below `extensionSettings.<section-id>`. */
 	key: Key;
@@ -105,6 +111,10 @@ export interface RegisteredExtensionSettingsSection {
 	readonly extensionPath: string;
 	readValues(): Readonly<Record<string, ExtensionSettingValue>>;
 	setValue(key: string, value: unknown): void;
+	/** Layer currently supplying `key`; `"default"` when nothing is configured. */
+	provenanceOf(key: string): ExtensionSettingProvenance;
+	/** Clear the project-layer value of `key` so the next launch falls back. */
+	resetToDefault(key: string): void;
 	getStatus(): readonly ExtensionSettingsStatusRow[];
 	isRestartRequired(key?: string): boolean;
 }

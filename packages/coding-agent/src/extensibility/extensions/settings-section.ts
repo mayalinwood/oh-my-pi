@@ -3,6 +3,7 @@ import type {
 	ExtensionSettingField,
 	ExtensionSettingsSectionDefinition,
 	ExtensionSettingsStatusRow,
+	ExtensionSettingProvenance,
 	ExtensionSettingValue,
 	RegisteredExtensionSettingsSection,
 } from "./types";
@@ -220,6 +221,26 @@ export function registerExtensionSettingsSection(
 	}
 	const readValues = () => decodeValues(id, fields, settings.getExtensionSettingsSection(id));
 	const snapshot = readValues();
+	const requireField = (key: string): ExtensionSettingField => {
+		const field = fields.find(candidate => candidate.key === key);
+		if (!field) throw new TypeError(`Unknown extension setting "${id}.${key}"`);
+		return field;
+	};
+	// A session-level decision outranks anything on disk, so those keys are not editable here.
+	// Surface that as a host-owned, content-free status row instead of a silent failure.
+	const PINNED_LAYERS: ReadonlySet<string> = new Set(["runtime", "overlay"]);
+	const pinnedFields = (): readonly ExtensionSettingsStatusRow[] => {
+		const pinned = fields.filter(field => PINNED_LAYERS.has(settings.getExtensionSettingsProvenance(id, field.key)));
+		if (pinned.length === 0) return Object.freeze([]);
+		const label = pinned.length === 1 ? pinned[0].key : `${pinned.length} settings`;
+		return Object.freeze([
+			Object.freeze({
+				label: "Session-pinned",
+				value: label,
+				description: "Supplied by a runtime override or config overlay; not editable in project config.",
+			}),
+		]);
+	};
 
 	return Object.freeze({
 		id,
@@ -230,11 +251,17 @@ export function registerExtensionSettingsSection(
 		extensionPath,
 		readValues,
 		setValue(key: string, value: unknown): void {
-			const field = fields.find(candidate => candidate.key === key);
-			if (!field) throw new TypeError(`Unknown extension setting "${id}.${key}"`);
-			settings.setProjectExtensionSetting(id, key, validateExtensionSettingValue(field, value));
+			settings.setProjectExtensionSetting(id, key, validateExtensionSettingValue(requireField(key), value));
 		},
-		getStatus: () => readStatusRows(statusProvider),
+		provenanceOf(key: string): ExtensionSettingProvenance {
+			requireField(key);
+			return settings.getExtensionSettingsProvenance(id, key);
+		},
+		resetToDefault(key: string): void {
+			requireField(key);
+			settings.resetExtensionSetting(id, key);
+		},
+		getStatus: () => Object.freeze([...readStatusRows(statusProvider), ...pinnedFields()]),
 		isRestartRequired(key?: string): boolean {
 			let current: Readonly<Record<string, ExtensionSettingValue>>;
 			try {

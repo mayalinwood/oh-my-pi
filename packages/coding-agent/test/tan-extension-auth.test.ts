@@ -29,7 +29,8 @@ const INLINE_SENTINEL = "tan-inline-fixture-sentinel-key";
 
 // No streamSimple / oauth: registration mutates only this ModelRegistry
 // instance, never a process-global custom-API/OAuth table.
-const EXTENSION_SOURCE = `export default function (pi) {
+const EXTENSION_SOURCE = `export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider(${JSON.stringify(PROVIDER)}, {
 		baseUrl: "https://tan-fixture.example.invalid/v1",
 		apiKey: ${JSON.stringify(SENTINEL)},

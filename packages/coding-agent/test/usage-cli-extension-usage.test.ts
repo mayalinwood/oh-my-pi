@@ -15,7 +15,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import * as utils from "@oh-my-pi/pi-utils";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
-const EXTENSION_SOURCE = `export default function (pi) {
+const EXTENSION_SOURCE = `export const capabilities = [{ kind: "provider:register" }]; export default function (pi) {
 	pi.registerProvider("ext-usage", {
 		usage: {
 			id: "ext-usage",
@@ -88,7 +88,7 @@ test("omp usage fetches extension usage without discovering the extension's mode
 	const catalogExtPath = tmp.join("catalog-ext.ts");
 	await Bun.write(
 		catalogExtPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: "provider:register" }]; export default function (pi) {
 	pi.registerProvider("ext-catalog", {
 		baseUrl: "http://127.0.0.1:1/v1",
 		api: "openai-completions",

@@ -45,6 +45,7 @@ const featuresQuestion: ExtensionAskDialogQuestion = {
 const scriptedAskProvider = `
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 
+export const capabilities = [{ kind: 'provider:register' }];
 export default function (pi) {
 	pi.registerProvider("scripted", {
 		baseUrl: "http://127.0.0.1:9/v1",
@@ -260,7 +261,7 @@ await runRpcMode(session, {
 		await Bun.write(
 			extensionPath,
 			`
-export default function(pi) {
+export const capabilities = [{ kind: "provider:register" }]; export default function(pi) {
   globalThis.fetch = async () => { throw new Error("Offline login fixture refuses network"); };
   // rpc-alias is a second login for rpc-ordinary's credentials, like openai-codex-device.
   for (const [id, secret, storeCredentialsAs] of [["rpc-secret", true], ["rpc-ordinary", false], ["rpc-alias", false, "rpc-ordinary"]]) {

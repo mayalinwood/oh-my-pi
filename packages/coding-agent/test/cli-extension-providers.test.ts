@@ -33,7 +33,8 @@ beforeAll(async () => {
 	dbPath = tmp.join("auth.db");
 	await fs.writeFile(
 		extPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider("bench-gw", {
 		baseUrl: "https://example.com/v1",
 		apiKey: "literal-test-key",
