@@ -119,8 +119,15 @@ function sourceOf(entry: AdvisorNote): string | undefined {
 /** Wrapped, truncated rail rows for a single note; shared by both branches. */
 function renderAdvisorNote(entry: AdvisorNote, width: number, uiTheme: Theme): string[] {
 	const badge = entry.severity ? `${formatBadge(entry.severity, severityColor(entry.severity), uiTheme)} ` : "";
-	const source = sourceOf(entry);
-	const who = source ? `${uiTheme.fg("dim", `[${replaceTabs(source)}]`)} ` : "";
+	// Attribute each note to its source and the model that wrote it. The implicit
+	// single ("default") advisor has no name to show, so its model stands alone.
+	const model = entry.advisorModel ? replaceTabs(entry.advisorModel) : "";
+	const who =
+		entry.advisor && entry.advisor !== "default"
+			? `${uiTheme.fg("dim", `[${replaceTabs(entry.advisor)}${model ? ` · ${model}` : ""}]`)} `
+			: model
+				? `${uiTheme.fg("dim", `[${model}]`)} `
+				: "";
 	const age = entry.turnsAgo !== undefined ? `${uiTheme.fg("dim", `T-${entry.turnsAgo}`)} ` : "";
 	const railGlyph = uiTheme.symbol("advisor.rail");
 	const rail = uiTheme.fg(severityColor(entry.severity), railGlyph);
@@ -183,8 +190,10 @@ function tallySpans(notes: readonly AdvisorNote[]): TspSpan[] {
 }
 
 /** Native spans for one note: its advisor when the callout mixes several, then the text. */
-function noteSpans(entry: AdvisorNote, attribute: boolean): TspSpan[] {
-	const who = attribute ? sourceOf(entry) : undefined;
+function noteSpans(entry: AdvisorNote): TspSpan[] {
+	const source = sourceOf(entry);
+	const model = entry.advisorModel ? replaceTabs(entry.advisorModel) : undefined;
+	const who = source ? `${source}${model ? ` · ${model}` : ""}` : model;
 	const body = span(plainText(entry.note));
 	return who ? [span(`${who} · `, "dim"), body] : [body];
 }
@@ -243,9 +252,8 @@ export function createAdvisorMessageCard(
 			],
 			"head",
 		);
-		const attribute = sources.size > 1;
 		const body = notes.map((entry, index) => {
-			const spans = noteSpans(entry, attribute);
+			const spans = noteSpans(entry);
 			if (notes.length === 1) return text(spans, { wrap: "word", role: "omp.advisor.note", key: `n${index}` });
 			const { tone, icon, label } = RANK_LOOK[rankOf(entry)];
 			return node(

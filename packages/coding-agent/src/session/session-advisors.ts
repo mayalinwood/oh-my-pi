@@ -1047,7 +1047,7 @@ export class SessionAdvisors {
 	/** Tracks persistence of a visible advisor card emitted outside the primary loop. */
 	trackCardEvent(processing: Promise<void>): void {
 		this.#pendingAdvisorCardEvents.add(processing);
-		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => { });
+		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
 	}
 
 	/** Waits for all advisor-card persistence handlers currently in flight. */
@@ -1275,8 +1275,8 @@ export class SessionAdvisors {
 			const reviewInterval = legacy
 				? undefined
 				: typeof configuredReviewInterval === "number" &&
-					Number.isSafeInteger(configuredReviewInterval) &&
-					configuredReviewInterval >= 1
+					  Number.isSafeInteger(configuredReviewInterval) &&
+					  configuredReviewInterval >= 1
 					? configuredReviewInterval
 					: 1;
 			// Catch-up override: schema-validated for WATCHDOG.yml entries, clamped
@@ -1285,7 +1285,7 @@ export class SessionAdvisors {
 			// "off" wins over a global strict/numeric policy.
 			const syncBacklog: AdvisorSyncBacklog | undefined =
 				config.syncBacklog !== undefined &&
-					(ADVISOR_SYNC_BACKLOG_MODES as readonly string[]).includes(config.syncBacklog)
+				(ADVISOR_SYNC_BACKLOG_MODES as readonly string[]).includes(config.syncBacklog)
 					? config.syncBacklog
 					: undefined;
 
@@ -1522,14 +1522,14 @@ export class SessionAdvisors {
 			// the UUIDv7 provider session id, not the local `-advisor` label.
 			const advisorTelemetry = this.#host.agent.telemetry
 				? {
-					...this.#host.agent.telemetry,
-					agent: {
-						id: advisorSessionLabel,
-						name: slug ? `${MODEL_ROLES.advisor.name}: ${advisorName}` : MODEL_ROLES.advisor.name,
-						description: formatModelString(advisorModel),
-					},
-					conversationId: undefined,
-				}
+						...this.#host.agent.telemetry,
+						agent: {
+							id: advisorSessionLabel,
+							name: slug ? `${MODEL_ROLES.advisor.name}: ${advisorName}` : MODEL_ROLES.advisor.name,
+							description: formatModelString(advisorModel),
+						},
+						conversationId: undefined,
+					}
 				: undefined;
 			// Mirror the SDK's provider-shaping options (streamFn/onPayload/...,
 			// providerSessionState, promptCacheKey, transformProviderContext) so each
@@ -1854,7 +1854,6 @@ export class SessionAdvisors {
 								content: formatAdvisorBatchContent(entries),
 								details: { notes: entries } satisfies AdvisorMessageDetails,
 							} satisfies CustomMessage),
-						} satisfies CustomMessage),
 				skipIdleFlush: true,
 			});
 		}
@@ -1912,7 +1911,11 @@ export class SessionAdvisors {
 			});
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		// The live agent model, not the cached `advisor.model`: compaction
+		// promotion and retry fallback retarget `agent.state.model` without
+		// updating that field, and a note must name the model that wrote it.
+		const model = formatModelString(advisor.agent.state.model);
+		const notes: AdvisorNote[] = [{ note, severity, advisor: source, advisorModel: model }];
 		const terminalAnswerNoQueuedWork = this.#hasTerminalTextAnswerWithoutQueuedWork();
 		// A note released from the withheld backlog rides the loop it was withheld
 		// from, but only while that loop is still running: once it has stopped no
@@ -1944,7 +1947,7 @@ export class SessionAdvisors {
 			withheldInLiveRun: delivery?.withheldInLiveRun,
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source, advisorModel: model });
 			return;
 		}
 		this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), channel === "steer");
@@ -2126,7 +2129,7 @@ export class SessionAdvisors {
 			a.recorderClosed = a.recorder.close();
 			closes.push(a.recorderClosed);
 		}
-		this.#advisorRecorderClosed = Promise.all(closes).then(() => { });
+		this.#advisorRecorderClosed = Promise.all(closes).then(() => {});
 		this.#advisors = [];
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
@@ -2287,11 +2290,11 @@ export class SessionAdvisors {
 		const message = assistantFailure?.errorMessage ?? (error instanceof Error ? error.message : String(error));
 		const errorId = assistantFailure
 			? AIError.classifyMessage({
-				api: currentModel.api,
-				errorId: assistantFailure.errorId,
-				errorMessage: message,
-				errorStatus: assistantFailure.errorStatus,
-			})
+					api: currentModel.api,
+					errorId: assistantFailure.errorId,
+					errorMessage: message,
+					errorStatus: assistantFailure.errorStatus,
+				})
 			: AIError.classify(error, currentModel.api);
 		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
 		// Text-ambiguous overflows waive the veto; usage-backed do not — see AIError.isTextAmbiguousContextOverflow (#9235).
@@ -3608,12 +3611,12 @@ export class SessionAdvisors {
 			options?.compact
 				? formatSessionHistoryMarkdown(a.agent.state.messages)
 				: formatSessionDumpText({
-					messages: a.agent.state.messages,
-					systemPrompt: a.agent.state.systemPrompt,
-					model: a.agent.state.model,
-					thinkingLevel: a.agent.state.thinkingLevel,
-					tools: a.agent.state.tools,
-				});
+						messages: a.agent.state.messages,
+						systemPrompt: a.agent.state.systemPrompt,
+						model: a.agent.state.model,
+						thinkingLevel: a.agent.state.thinkingLevel,
+						tools: a.agent.state.tools,
+					});
 		if (this.#advisors.length === 1) return dump(this.#advisors[0]);
 		return this.#advisors
 			.map(a => `### Advisor: ${a.name} (${a.agent.state.model.provider}/${a.agent.state.model.id})\n\n${dump(a)}`)
