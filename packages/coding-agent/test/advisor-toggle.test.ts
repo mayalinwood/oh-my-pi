@@ -1728,6 +1728,68 @@ describe("AgentSession advisor toggle", () => {
 		}
 	});
 
+	it("routes advice a conversation re-prime destroys instead of dropping it with the backlog", async () => {
+		// The re-prime is the one reset path that collected nothing: it called
+		// resetDeliveredNotes() and the tool erased the backlog, so a note the
+		// emission guard had admitted AND acknowledged as queued simply stopped
+		// existing. It must come out the other side as visible advice — the same
+		// treatment the extension context refresh already gives it.
+		const note = "Concern: the /new re-prime ate the withheld note.";
+		const mock = createMockModel({
+			responses: [{ content: ["primary opening"] }, { content: ["primary done"] }],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const reprimeSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(reprimeSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = reprimeSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await reprimeSession.prompt("start the work");
+			await reprimeSession.waitForIdle();
+
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-across-reprime", { note, severity: "concern" });
+			expect(reprimeSession.messages.some(message => JSON.stringify(message).includes(note))).toBe(false);
+
+			// `/new`: the conversation boundary the backlog used to die on.
+			await reprimeSession.resetSessionContext();
+			await reprimeSession.waitForIdle();
+
+			expect(
+				reprimeSession.messages.some(
+					message => message.role === "custom" && JSON.stringify(message).includes(note),
+				),
+			).toBe(true);
+		} finally {
+			await reprimeSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("propagates the resolved budget into the advisor model-visible system prompt", () => {
 		// Contract: SessionAdvisors must render the resolved budget into the
 		// prompt the advisor model actually receives. If the runtime stopped

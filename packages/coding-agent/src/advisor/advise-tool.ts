@@ -11,7 +11,13 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import { escapeXmlAttribute, escapeXmlText, logger } from "@oh-my-pi/pi-utils";
 import adviseDescription from "../prompts/advisor/advise-tool.md" with { type: "text" };
-import { AdvisorEmissionGuard, type AdvisorSuppressionReason, normalizeAdvisorNote } from "./emission-guard";
+import {
+	ADVISOR_DEFAULT_BUDGET_PER_UPDATE,
+	ADVISOR_MAX_BUDGET_PER_UPDATE,
+	AdvisorEmissionGuard,
+	type AdvisorSuppressionReason,
+	normalizeAdvisorNote,
+} from "./emission-guard";
 
 const adviseSchema = type({
 	note: type("string").describe(
@@ -196,6 +202,32 @@ export function compareAdvisorNotes(a: AdvisorNote, b: AdvisorNote): number {
 	return advisorSeverityRank(b.severity) - advisorSeverityRank(a.severity);
 }
 
+/**
+ * Hard ceiling on the withheld backlog. One advisor update admits at most
+ * {@link ADVISOR_MAX_BUDGET_PER_UPDATE} non-blockers, so a backlog that reaches
+ * this size can only exist when a single run accumulated more than one maximal
+ * update's worth — the pathological in-progress mode. Below the ceiling no
+ * note is destroyed in any configuration, however the per-update budget is
+ * tuned, so the bound costs a healthy run nothing.
+ */
+export const ADVISOR_MAX_DEFERRED_NOTES = ADVISOR_MAX_BUDGET_PER_UPDATE;
+
+/**
+ * How many notes one boundary release may carry individually before the
+ * backlog is worth collapsing into a single summary. Two reviews' worth, on the
+ * system's own scale: {@link ADVISOR_DEFAULT_BUDGET_PER_UPDATE} is what one
+ * advisor review is expected to produce, and releasing two reviews' worth note
+ * by note is still a readable turn. Deliberately a constant rather than the
+ * guard's configured per-update budget: that budget is a rate limit an operator
+ * tunes down as well as up, and at 1 it would collapse the two-note backlog
+ * patch 0009 exists to release whole. Fixed, it also puts a hard ceiling on the
+ * worst-case single release instead of leaving it to the configuration.
+ */
+export const ADVISOR_DEFERRED_RELEASE_LIMIT = 2 * ADVISOR_DEFAULT_BUDGET_PER_UPDATE;
+
+/** How many of the coalesced backlog's notes the summary card quotes verbatim. */
+const ADVISOR_COALESCED_QUOTES = 2;
+
 /** Admission acks: one line each — the advisor needs the verdict, not a policy essay. */
 const ADVISOR_ACK_SENT = "Delivered.";
 /** Held behind the in-progress primary turn; flushed when it completes. */
@@ -209,10 +241,45 @@ const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
 };
 
 /**
+ * What a caller of the withheld backlog must deliver, and what the backlog's
+ * bound destroyed on the way out.
+ */
+export interface AdvisorDeferredLoss {
+	/**
+	 * Notes to deliver, oldest first. Empty only when nothing was withheld and
+	 * nothing was destroyed. A backlog too deep for one readable turn is
+	 * collapsed HERE into exactly one summary note, so this is never a burst
+	 * however long the backlog ran.
+	 */
+	notes: { note: string; severity?: AdviseDetails["severity"]; turn?: number }[];
+	/**
+	 * Admitted notes the bound destroyed with nothing in their place. Each was
+	 * acknowledged to the advisor as queued, so the count is what makes the loss
+	 * knowable rather than merely smaller.
+	 */
+	dropped: number;
+	/**
+	 * The largest the backlog actually got between drains, never above
+	 * {@link ADVISOR_MAX_DEFERRED_NOTES}. The bound is a resource limit, so
+	 * without this the only evidence it engaged would be a number the drain
+	 * reports identically whether it ran or not.
+	 */
+	peak: number;
+}
+
+/**
  * How one admitted note reached the primary. Set only for a note the tool
- * withheld behind an in-progress turn and then released.
+ * withheld behind an in-progress turn and then released, or one stamped with
+ * the primary turn its review covered.
  */
 export interface AdvisorAdviceDelivery {
+	/**
+	 * Primary-turn count the review that produced the note covered. The caller
+	 * compares it with the turns completed at delivery, so a merged batch can
+	 * report how stale the advice was (`turns_ago`) instead of presenting a note
+	 * about earlier work as a description of the current state.
+	 */
+	turn?: number;
 	/**
 	 * The release happened at a boundary where the primary is guaranteed to poll
 	 * asides again because it is about to make another request. The note must
@@ -247,6 +314,9 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 */
 	readonly #guard: AdvisorEmissionGuard;
 	#inProgressUpdate = false;
+	/** Primary-turn count the in-flight update reviews (stamped on emitted notes
+	 *  so merged batches can report how stale each review was at delivery). */
+	#coveredTurn: number | undefined;
 	/** Notes admitted but withheld while the primary was mid-turn, in arrival
 	 *  order. Flushed deterministically at the next primary turn boundary (or the
 	 *  completed-update transition), so delivery does not depend on the advisor
@@ -259,7 +329,14 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		key: string;
 		note: string;
 		severity?: AdviseDetails["severity"];
+		turn?: number;
 	}[] = [];
+	/** Admitted notes {@link ADVISOR_MAX_DEFERRED_NOTES} destroyed with no
+	 *  replacement. The primary was told every one of them was queued, so the
+	 *  count rides out with the backlog rather than dying inside the tool. */
+	#deferredDropped = 0;
+	/** High-water mark of the backlog since the last drain. */
+	#deferredPeak = 0;
 
 	/**
 	 * @param onAdvice Route an admitted note to the primary (channel selection +
@@ -291,10 +368,14 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 * completed update flushes the withheld backlog, oldest first — each note
 	 * was admitted when emitted, so the flush routes without re-admission and a
 	 * backlog of one note per originating update reaches the primary intact.
+	 *
+	 * @param coveredTurn Primary-turn count this update reviews; stamped on every
+	 *   note it emits (see {@link AdvisorAdviceDelivery.turn}).
 	 */
-	beginUpdate(inProgress: boolean): void {
+	beginUpdate(inProgress: boolean, coveredTurn?: number): void {
 		const wasInProgress = this.#inProgressUpdate;
 		this.#inProgressUpdate = inProgress;
+		this.#coveredTurn = coveredTurn;
 		this.#guard.beginUpdate();
 		if (wasInProgress && !inProgress) this.#flushDeferred("terminal");
 	}
@@ -309,18 +390,27 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 * Flushed notes stay charged to their originating update as routed
 	 * deliveries.
 	 */
-	flushDeferredNotes(release: AdvisorWithheldRelease = "terminal"): void {
+	flushDeferredNotes(release: AdvisorWithheldRelease = "terminal"): AdvisorDeferredLoss {
 		this.#inProgressUpdate = false;
-		this.#flushDeferred(release);
+		return this.#flushDeferred(release);
 	}
 
-	/** Clear all note state when the advisor starts a fresh conversation: the
-	 *  guard's dedupe/budget memory and this tool's pending backlog reset
-	 *  together, so a re-primed advisor can re-raise old issues. */
-	resetDeliveredNotes(): void {
+	/**
+	 * Clear all note state when the advisor starts a fresh conversation: the
+	 * guard's dedupe/budget memory and this tool's pending backlog reset
+	 * together, so a re-primed advisor can re-raise old issues.
+	 *
+	 * The removal is no longer silent and no longer free: it returns what it
+	 * destroyed, coalesced, so every caller learns the amount rather than being
+	 * able to discard it unread. A caller that ignores the return value has
+	 * still lost the notes, but it can no longer do so without the tool having
+	 * named them.
+	 */
+	resetDeliveredNotes(): AdvisorDeferredLoss {
+		const loss = this.#drainDeferred();
 		this.#guard.reset();
 		this.#inProgressUpdate = false;
-		this.#deferredNotes = [];
+		return loss;
 	}
 
 	/**
@@ -332,10 +422,8 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 * still gets the fresh conversation semantics from
 	 * {@link resetDeliveredNotes}.
 	 */
-	takeDeferredNotes(): { note: string; severity?: AdviseDetails["severity"] }[] {
-		const pending = this.#deferredNotes;
-		this.#deferredNotes = [];
-		return pending.map(({ note, severity }) => ({ note, severity }));
+	takeDeferredNotes(): AdvisorDeferredLoss {
+		return this.#drainDeferred();
 	}
 
 	async execute(
@@ -370,7 +458,20 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				const displacedIndex = this.#deferredNotes.findIndex(item => item.key === decision.displacedKey);
 				if (displacedIndex !== -1) this.#deferredNotes.splice(displacedIndex, 1);
 			}
-			this.#deferredNotes.push({ key, note: args.note, severity: args.severity });
+			if (this.#deferredNotes.length >= ADVISOR_MAX_DEFERRED_NOTES) {
+				// The backlog is at its bound. One pending note has to go, and it is
+				// counted rather than dropped in silence: the advisor was told it was
+				// queued, so the primary is owed the arithmetic. A strictly
+				// lower-ranked victim is preferred so an escalation never displaces
+				// an equal-or-more-severe note; when the newcomer is the mildest
+				// thing in the backlog it takes the OLDEST slot instead — the note
+				// that has described already-finished work for longest is the least
+				// worth keeping, and freezing it there is what ageing a backlog is.
+				this.#deferredNotes.splice(this.#evictableIndex(rank), 1);
+				this.#deferredDropped++;
+			}
+			this.#deferredNotes.push({ key, note: args.note, severity: args.severity, turn: this.#coveredTurn });
+			if (this.#deferredNotes.length > this.#deferredPeak) this.#deferredPeak = this.#deferredNotes.length;
 			return this.#result(ADVISOR_ACK_DEFERRED, args);
 		}
 		// Live path (completed update, or a blocker that must interrupt now). A
@@ -382,27 +483,119 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (reservedIndex !== -1) this.#deferredNotes.splice(reservedIndex, 1);
 		const decision = this.#guard.admit(args.note, { rank, pending: false });
 		if (!decision.accepted) return this.#suppressed(args, decision.reason);
-		this.onAdvice(args.note, args.severity);
+		// The stamp rides only when the update reviewed a known turn, so a caller
+		// that never supplies one keeps the plain two-argument live signature.
+		if (this.#coveredTurn !== undefined) this.onAdvice(args.note, args.severity, { turn: this.#coveredTurn });
+		else this.onAdvice(args.note, args.severity);
 		return this.#result(ADVISOR_ACK_SENT, args);
 	}
 
 	/** Route every withheld note, oldest first, without re-admission — each was
 	 *  admitted when emitted. Routed notes are marked so their originating
 	 *  update's slots stay charged and can no longer be displaced. */
-	#flushDeferred(release: AdvisorWithheldRelease): void {
-		if (this.#deferredNotes.length === 0) return;
-		const pending = this.#deferredNotes;
-		this.#deferredNotes = [];
-		const delivery: AdvisorAdviceDelivery | undefined =
-			release === "continuation" ? { withheldInLiveRun: true } : undefined;
-		for (const { note, severity } of pending) {
+	#flushDeferred(release: AdvisorWithheldRelease): AdvisorDeferredLoss {
+		const loss = this.#drainDeferred();
+		const { notes } = loss;
+		if (notes.length === 0) return loss;
+		for (const { note, severity, turn } of notes) {
 			this.#guard.markRouted(note);
-			// The release tag rides only the continuation release: the terminal one
-			// keeps the two-argument live signature so a terminal flush is
+			// The delivery tag rides only when it says something: the continuation
+			// release, and/or the turn the note's review covered. A terminal flush of
+			// an unstamped note keeps the two-argument live signature, so it is
 			// indistinguishable from an ordinary routed note.
-			if (delivery) this.onAdvice(note, severity, delivery);
+			const delivery: AdvisorAdviceDelivery = {};
+			if (release === "continuation") delivery.withheldInLiveRun = true;
+			if (turn !== undefined) delivery.turn = turn;
+			if (Object.keys(delivery).length > 0) this.onAdvice(note, severity, delivery);
 			else this.onAdvice(note, severity);
 		}
+		return loss;
+	}
+
+	/**
+	 * Empty the backlog into the delivery its depth earns. While it fits one
+	 * readable turn the notes pass through individually, oldest first, so the
+	 * existing per-review behaviour is unchanged. Once it does not, they leave
+	 * as EXACTLY ONE summary note carrying the withheld count, the most severe
+	 * content quoted, and the number the bound destroyed — a backlog that ran
+	 * away must not arrive as a burst of advice the primary has already finished
+	 * acting on. The drop report counts against the same readable turn, so the
+	 * worst-case release is bounded by the guard's per-update budget rather than
+	 * by how long the run went on.
+	 */
+	#drainDeferred(): AdvisorDeferredLoss {
+		const pending = this.#deferredNotes;
+		const boundDropped = this.#deferredDropped;
+		const peak = this.#deferredPeak;
+		this.#deferredNotes = [];
+		this.#deferredDropped = 0;
+		this.#deferredPeak = 0;
+		const carried = pending.map(({ note, severity, turn }) => ({ note, severity, turn }));
+		// A drop report is itself a delivery, so it is charged against the turn
+		// before the readable-fit test — otherwise an at-capacity backlog plus a
+		// report would release one more card than the budget allows.
+		const dropReport = boundDropped > 0 ? [this.#dropReport(boundDropped)] : [];
+		if (carried.length === 0) return { notes: dropReport, dropped: boundDropped, peak };
+		if (carried.length + dropReport.length <= ADVISOR_DEFERRED_RELEASE_LIMIT) {
+			return { notes: [...carried, ...dropReport], dropped: boundDropped, peak };
+		}
+		const ranked = carried
+			.map((item, index) => ({ item, index }))
+			.sort(
+				(a, b) =>
+					advisorSeverityRank(b.item.severity) - advisorSeverityRank(a.item.severity) ||
+					// Equal rank keeps the most recent: a note that has been sitting
+					// longest behind a mid-turn run describes the work least like
+					// what the primary is doing now.
+					b.index - a.index,
+			);
+		const quoted = ranked
+			.slice(0, ADVISOR_COALESCED_QUOTES)
+			.sort((a, b) => a.index - b.index)
+			.map(({ item }) => item);
+		const withheld = carried.length + boundDropped;
+		const dropped = withheld - quoted.length;
+		return {
+			notes: [
+				{
+					note:
+						`${withheld} advisor notes were withheld behind this turn. ${dropped} of them were dropped to keep the backlog readable; ` +
+						`the ${quoted.length === 1 ? "most severe one is" : `most severe ${quoted.length} are`} quoted here:\n` +
+						quoted.map(item => `- ${item.note}`).join("\n"),
+					// Carry the backlog's real weight: a concern buried in the
+					// summary still gets the concern channel, a wall of nits still
+					// rides the non-interrupting aside.
+					severity: carried.reduce<AdviseDetails["severity"]>(
+						(highest, item) =>
+							advisorSeverityRank(item.severity) > advisorSeverityRank(highest) ? item.severity : highest,
+						undefined,
+					),
+				},
+			],
+			dropped,
+			peak,
+		};
+	}
+
+	/** One card naming notes the bound destroyed, at plain-nit weight: the
+	 *  primary is told the backlog overflowed, it is not woken for it. */
+	#dropReport(dropped: number): { note: string; severity?: AdviseDetails["severity"] } {
+		return {
+			note: `${dropped} advisor ${dropped === 1 ? "note was" : "notes were"} withheld behind this turn and dropped: the backlog reached its bound of ${ADVISOR_MAX_DEFERRED_NOTES} before the turn ended.`,
+		};
+	}
+
+	/**
+	 * Which pending slot a full backlog yields to a newcomer of `rank`: the
+	 * oldest note the newcomer outranks, or — when nothing in the backlog is
+	 * milder — the oldest note outright. Always defined, because the backlog is
+	 * only consulted once it is at {@link ADVISOR_MAX_DEFERRED_NOTES}.
+	 */
+	#evictableIndex(rank: number): number {
+		for (let i = 0; i < this.#deferredNotes.length; i++) {
+			if (rank > advisorSeverityRank(this.#deferredNotes[i]!.severity)) return i;
+		}
+		return 0;
 	}
 
 	/** Truthful suppression acknowledgment keyed by the guard's reason: a

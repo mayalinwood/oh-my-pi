@@ -51,6 +51,7 @@ import {
 	type AdvisorAdviceDelivery,
 	type AdvisorAgent,
 	type AdvisorReviewMode,
+	type AdvisorDeferredLoss,
 	AdvisorEmissionGuard,
 	type AdvisorHeldUpdates,
 	AdvisorLoopGuard,
@@ -347,6 +348,8 @@ interface ActiveAdvisor {
 	syncBacklog: AdvisorSyncBacklog | undefined;
 	/** Eligible updates since the last reset; a review is scheduled at each multiple of the interval. */
 	eligibleUpdates: number;
+	/** Primary turns completed when the review now pending was scheduled; stamped on its notes so a late one reports `turns_ago`. */
+	pendingCoveredTurn: number;
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
 	/**
@@ -700,6 +703,7 @@ export class SessionAdvisors {
 				if (scheduled) {
 					scheduledAdvisors ??= [];
 					scheduledAdvisors.push(advisor);
+					advisor.pendingCoveredTurn = this.#advisorPrimaryTurnsCompleted;
 				}
 				try {
 					advisor.runtime.onTurnEnd(messages, { willContinue, dispatch: scheduled });
@@ -1137,6 +1141,7 @@ export class SessionAdvisors {
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
+		const stranded: { advisor: ActiveAdvisor; loss: AdvisorDeferredLoss }[] = [];
 		for (const a of this.#advisors) {
 			a.agentUnsubscribe?.();
 			a.agentUnsubscribe = undefined;
@@ -1145,13 +1150,33 @@ export class SessionAdvisors {
 			// conversation starts with a fresh retry allowance (issue #11947).
 			a.providerWaitRetries = 0;
 			this.#releaseRefusalPin(a);
-			// Resets the emission guard and every tool-side note state together.
-			a.adviseTool.resetDeliveredNotes();
+			// Resets the emission guard and every tool-side note state together. The
+			// return value is what the re-prime destroyed: notes the primary was
+			// still owed, and the count the backlog bound dropped. Collect it here
+			// and route it below — the advisory above is explicit that these
+			// deliveries must not inject into the new conversation, and advice the
+			// primary was already told was queued is not one of them.
+			stranded.push({ advisor: a, loss: a.adviseTool.resetDeliveredNotes() });
 			a.eligibleUpdates = 0;
 			this.#attachAdvisorRecorderFeed(a);
 		}
 		this.#resetAdvisorDeliveryLatches();
 		this.#clearAdvisorDeliveryState();
+		// Routed after the delivery state is cleared, mirroring the extension
+		// context-refresh path: the tool has already coalesced this into at most
+		// one card, so a deep backlog costs the new conversation a single
+		// summary rather than a burst, and the destruction is named in it.
+		for (const { advisor, loss } of stranded) {
+			if (loss.dropped > 0) {
+				logger.info("advisor notes destroyed by the withheld backlog bound across a conversation re-prime", {
+					advisor: advisor.name,
+					dropped: loss.dropped,
+				});
+			}
+			for (const pending of loss.notes) {
+				this.#routeAdvice(advisor, pending.note, pending.severity);
+			}
+		}
 	}
 
 	#resetAdvisorDeliveryLatches(): void {
@@ -1693,7 +1718,10 @@ export class SessionAdvisors {
 					// notes — both owned by the tool now. A queued WIP review may
 					// start after a terminal boundary flushed deferred notes; do not
 					// re-arm in-progress deferral.
-					advisorRef.adviseTool.beginUpdate(inProgress && this.#advisorPrimaryWillContinue);
+					advisorRef.adviseTool.beginUpdate(
+						inProgress && this.#advisorPrimaryWillContinue,
+						advisorRef.pendingCoveredTurn,
+					);
 				},
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
@@ -1764,6 +1792,7 @@ export class SessionAdvisors {
 				reviewInterval: descriptor.reviewInterval,
 				syncBacklog: descriptor.syncBacklog,
 				eligibleUpdates: carried?.get(slug)?.eligibleUpdates ?? 0,
+				pendingCoveredTurn: this.#advisorPrimaryTurnsCompleted,
 				retryFallbackPendingSuccess: false,
 				providerWaitRetries: 0,
 				signature,
@@ -1846,7 +1875,9 @@ export class SessionAdvisors {
 				note,
 				severity,
 				advisor: source,
-				turn: this.#advisorPrimaryTurnsCompleted,
+				// The turn the producing review covered, not the turn the note landed
+				// on: a late review's note is how the merged batch shows its age.
+				turn: delivery?.turn ?? this.#advisorPrimaryTurnsCompleted,
 			});
 			return;
 		}
@@ -2035,9 +2066,13 @@ export class SessionAdvisors {
 	 *  plus whatever the aside dispatcher is holding, in that order. */
 	#collectStrandedNotes(): AdvisorNote[] {
 		return [
-			...this.#advisors.flatMap(a =>
-				a.adviseTool.takeDeferredNotes().map(note => ({ ...note, advisor: a.slug ? a.name : undefined })),
-			),
+			...this.#advisors.flatMap(a => {
+				// The tool coalesces: a backlog too deep for one readable turn
+				// leaves as a single summary note carrying its own count, so this
+				// is a summary the primary sees, not a silent subtraction.
+				const advisor = a.slug ? a.name : undefined;
+				return a.adviseTool.takeDeferredNotes().notes.map(note => ({ ...note, advisor }));
+			}),
 			...this.#host.yieldQueue.take<AdvisorNote>("advisor"),
 		];
 	}
@@ -3130,7 +3165,7 @@ export class SessionAdvisors {
 				advisor.agentUnsubscribe = undefined;
 				advisor.runtime.refreshContext(count, "extension-context-refresh");
 				advisor.providerWaitRetries = 0;
-				for (const pending of advisor.adviseTool.takeDeferredNotes()) {
+				for (const pending of advisor.adviseTool.takeDeferredNotes().notes) {
 					released.push({ advisor, note: pending.note, severity: pending.severity });
 				}
 				// The tool owns the emission guard and resets its dedupe memory here.

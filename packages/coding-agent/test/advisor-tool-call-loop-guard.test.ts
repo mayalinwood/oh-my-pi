@@ -519,6 +519,35 @@ describe("advisor tool-call loop guard", () => {
 		expect(reviewStarts).toHaveLength(0);
 	});
 
+	it("stamps a withheld note with the turn its review covered, so the merged batch reports its age", async () => {
+		// Three primary turns, a review every second boundary, catch-up off: the
+		// review that covers turn 2 emits after that boundary while the primary is
+		// still mid-run, so its concern is withheld and only reaches the primary at
+		// the terminal boundary (turn 3). With a waiting catch-up the boundary would
+		// release it into the very next request instead (covered by the "newest
+		// ready note" test), so the stale path needs the asynchronous policy.
+		// The note describes turn 2, so the batch must say it is one turn old
+		// instead of presenting it as the current state of the work.
+		const note = "Concern: the retry loop never backs off.";
+		createAdvisor(
+			{ "advisor.syncBacklog": "off" },
+			0,
+			{ name: "Interval reviewer", reviewInterval: 2 },
+			2,
+			note,
+			"concern",
+		);
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("inspect missing file");
+		expect(await session.waitForAdvisorCatchup(2_000)).toBe(true);
+		const delivered = [...session.agent.state.messages, ...session.yieldQueue.drainLazy().map(build => build())]
+			.flatMap(message => (message?.role === "custom" ? [JSON.stringify(message.content)] : []))
+			.filter(content => content.includes(note));
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]).toContain('turns_ago=\\"1\\"');
+	});
+
 	it("defers agent-end review across tool-loop continuation", async () => {
 		const { contexts } = createAdvisor(
 			{ "advisor.syncBacklog": "1" },
