@@ -122,7 +122,13 @@ function countFraming(items: readonly unknown[] | undefined, tokenizer: Tokenize
 
 function toolFragments(tools: readonly Tool[]): string[] {
 	const fragments: string[] = [];
-	for (const tool of tools) fragments.push(tool.name, tool.description, stringifyJson(tool.parameters) ?? "");
+	for (const tool of tools) {
+		const name = tool.name;
+		const description = tool.description;
+		if (typeof name === "string") fragments.push(name);
+		if (typeof description === "string") fragments.push(description);
+		fragments.push(stringifyJson(tool.parameters) ?? "");
+	}
 	return fragments;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AssistantMessage, Context, Message, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Message, Model, Tool } from "@oh-my-pi/pi-ai";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -102,6 +102,25 @@ describe("fitOutputTokensToContextWindow", () => {
 		const cap = fitOutputTokensToContextWindow(model, context, undefined, tokenizer);
 
 		expect(cap).toBeGreaterThan(0);
+		expect(cap).toBe(fitOutputTokensToContextWindow(model, normalizedContext, undefined, tokenizer));
+	});
+	test("counts only string-valued active and retired tool metadata in cold contexts", () => {
+		const invalidActiveTool = { name: undefined, description: "active", parameters: {} } as unknown as Tool;
+		const invalidInactiveTool = { name: "retired", description: undefined, parameters: {} } as unknown as Tool;
+		const context: Context = {
+			...promptOf(500),
+			tools: [invalidActiveTool],
+			inactiveTools: [invalidInactiveTool],
+		};
+		const normalizedContext: Context = {
+			...promptOf(500),
+			tools: [{ name: "", description: "active", parameters: {} as never }],
+			inactiveTools: [{ name: "retired", description: "", parameters: {} as never }],
+		};
+		const model = { ...deepseek, contextWindow: 1_800, maxTokens: 1_500 };
+		const cap = fitOutputTokensToContextWindow(model, context, undefined, tokenizer);
+
+		expect(cap).toBeLessThan(1_500);
 		expect(cap).toBe(fitOutputTokensToContextWindow(model, normalizedContext, undefined, tokenizer));
 	});
 
