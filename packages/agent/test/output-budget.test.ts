@@ -87,6 +87,23 @@ describe("fitOutputTokensToContextWindow", () => {
 		const cap = fitOutputTokensToContextWindow(deepseek, context, undefined, tokenizer) ?? 0;
 		expect(cap).toBeLessThanOrEqual(1_000_000 - 700_000);
 	});
+	test("counts only normalized system prompt fragments when runtime hooks return invalid values", () => {
+		const fragments = Array.from({ length: 16 }, (_, index) => `system ${index}`) as unknown[];
+		fragments[7] = undefined;
+		const context: Context = {
+			systemPrompt: fragments as string[],
+			messages: promptOf(2_000).messages,
+		};
+		const normalizedContext: Context = {
+			...context,
+			systemPrompt: fragments.filter((fragment): fragment is string => typeof fragment === "string"),
+		};
+		const model = { ...deepseek, contextWindow: 8_000 };
+		const cap = fitOutputTokensToContextWindow(model, context, undefined, tokenizer);
+
+		expect(cap).toBeGreaterThan(0);
+		expect(cap).toBe(fitOutputTokensToContextWindow(model, normalizedContext, undefined, tokenizer));
+	});
 
 	test("keeps an OpenRouter default cap omitted, but still fits an explicit one", () => {
 		// The transport omits OpenRouter catalog defaults so upstreams self-cap;

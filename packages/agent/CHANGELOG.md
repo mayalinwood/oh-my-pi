@@ -7,6 +7,9 @@
 ### Added
 
 - Hosts can distinguish safely paused agents from turns still draining with `Agent.isPaused` ([#17073](https://github.com/can1357/oh-my-pi/pull/17073) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+### Fixed
+
+- Prompt output-budget sizing now counts normalized system-prompt fragments instead of failing on non-string values in runtime context.
 
 ## [18.13.0] - 2026-10-26
 

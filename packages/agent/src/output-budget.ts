@@ -1,4 +1,5 @@
 import type { Context, Model, Tool } from "@oh-my-pi/pi-ai";
+import { normalizeSystemPrompts } from "@oh-my-pi/pi-ai/utils";
 import { stopsOutputAtContextWindow } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { stringifyJson } from "@oh-my-pi/pi-utils";
 import { findRequestUsageAnchor } from "./compaction/transcript-tokens";
@@ -146,7 +147,7 @@ function countPromptTokens(context: Context, tokenizer: Tokenizer): number {
 function countContextTokens(context: Context, tokenizer: Tokenizer): number {
 	const { systemPrompt, tools, inactiveTools } = context;
 	return (
-		countFraming(systemPrompt, tokenizer, () => [...(systemPrompt ?? [])]) +
+		countFraming(systemPrompt, tokenizer, () => normalizeSystemPrompts(systemPrompt)) +
 		countFraming(tools, tokenizer, () => toolFragments(tools ?? [])) +
 		// Anthropic replays retired tool definitions, so they are prompt too.
 		countFraming(inactiveTools, tokenizer, () => toolFragments(inactiveTools ?? [])) +

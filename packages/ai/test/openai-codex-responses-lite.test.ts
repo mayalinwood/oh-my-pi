@@ -448,6 +448,30 @@ describe("openai-codex fresh execution input shaping", () => {
 			},
 		]);
 	});
+	it("omits invalid runtime system prompt fragments from Codex request bodies", async () => {
+		const model = createCodexModel("gpt-5.1-codex");
+		const body = await buildTransformedCodexRequestBody(
+			model,
+			{
+				systemPrompt: ["Primary prompt.", undefined, "Secondary prompt."] as unknown as string[],
+				messages: [{ role: "user", content: "Start execution", timestamp: Date.now() }],
+			},
+			undefined,
+		);
+
+		expect(body.instructions).toBe("Primary prompt.");
+		expect(body.input).toEqual([
+			{
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: "Secondary prompt." }],
+			},
+			{
+				role: "user",
+				content: [{ type: "input_text", text: "Start execution" }],
+			},
+		]);
+	});
 
 	it("does not add a continuation when user input is present", async () => {
 		const model = createCodexModel("gpt-5.1-codex");

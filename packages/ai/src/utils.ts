@@ -30,9 +30,13 @@ export function getHeaderCaseInsensitive(
 export function normalizeSystemPrompts(systemPrompt: readonly string[] | string | undefined | null): string[] {
 	if (systemPrompt === undefined || systemPrompt === null) return [];
 	const prompts = Array.isArray(systemPrompt) ? systemPrompt : typeof systemPrompt === "string" ? [systemPrompt] : [];
-	return prompts
-		.map(prompt => redactSensitiveCredentials(prompt.toWellFormed()))
-		.filter(prompt => prompt.trim().length > 0);
+	const normalized: string[] = [];
+	for (const prompt of prompts) {
+		if (typeof prompt !== "string") continue;
+		const sanitized = redactSensitiveCredentials(prompt.toWellFormed());
+		if (sanitized.trim().length > 0) normalized.push(sanitized);
+	}
+	return normalized;
 }
 
 type ResponsesToolItemIdPrefix = "fc" | "ctc";
