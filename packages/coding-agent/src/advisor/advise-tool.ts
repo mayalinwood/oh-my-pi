@@ -114,6 +114,12 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *   downgraded to asides (preserved when idle on a terminal answer). A `blocker`
  *   is exempt: it means the agent handed off broken or unexercised work, so it
  *   still steers a triggered turn even right after a prior interrupt (#5628).
+ * - A note the tool withheld behind an in-progress turn and released at a
+ *   boundary where the primary is about to make another request keeps the
+ *   non-interrupting channel the withholding promised: escalating it to a steer
+ *   there would hijack the run the withholding protected, and preserving it would
+ *   strand it while that run is still going. A `blocker` is exempt — it is never
+ *   withheld, so it keeps its authority to interrupt.
  */
 export function resolveAdvisorDeliveryChannel(opts: {
 	severity: AdvisorSeverity | undefined;
@@ -125,8 +131,10 @@ export function resolveAdvisorDeliveryChannel(opts: {
 	terminalAnswerNoQueuedWork?: boolean;
 	interruptImmuneTurnActive?: boolean;
 	preserveOnly?: boolean;
+	withheldInLiveRun?: boolean;
 }): AdvisorDeliveryChannel {
 	if (opts.preserveOnly && !opts.streaming) return "preserve";
+	if (opts.withheldInLiveRun && opts.severity !== "blocker") return "aside";
 	const terminalIdle = opts.terminalAnswerNoQueuedWork === true && !opts.streaming && !opts.aborting;
 	if (terminalIdle) {
 		if (!meetsAdvisorSeverity(opts.severity, opts.continueSeverity)) return "preserve";
@@ -200,6 +208,31 @@ const ADVISOR_ACK_SUPPRESSED: Record<AdvisorSuppressionReason, string> = {
 	"rate-limit": "Dropped: this update's advice budget is spent.",
 };
 
+/**
+ * How one admitted note reached the primary. Set only for a note the tool
+ * withheld behind an in-progress turn and then released.
+ */
+export interface AdvisorAdviceDelivery {
+	/**
+	 * The release happened at a boundary where the primary is guaranteed to poll
+	 * asides again because it is about to make another request. The note must
+	 * therefore ride the non-interrupting channel into that run instead of
+	 * escalating to a steer or waiting for the run to end.
+	 */
+	withheldInLiveRun?: boolean;
+}
+
+/**
+ * Where a withheld note is released relative to the primary's run.
+ *
+ * - `continuation`: the primary's loop continues, so the next boundary poll
+ *   consumes an aside inside the same run.
+ * - `terminal`: the run is over and no further boundary follows, so the note is
+ *   routed under the terminal policy (a visible card) rather than queued for a
+ *   poll that will not come until the next user prompt.
+ */
+export type AdvisorWithheldRelease = "continuation" | "terminal";
+
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
 	readonly name = "advise";
 	readonly label = "Advise";
@@ -214,25 +247,25 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 */
 	readonly #guard: AdvisorEmissionGuard;
 	#inProgressUpdate = false;
-	/** Primary-turn count the in-flight update reviews (stamped on emitted notes
-	 *  so merged batches can report how stale each review was at delivery). */
-	#coveredTurn: number | undefined;
 	/** Notes admitted but withheld while the primary was mid-turn, in arrival
-	 *  order. Flushed deterministically at the completed-update transition or an
-	 *  explicit {@link flushDeferredNotes}, so delivery does not depend on the
-	 *  advisor model choosing to re-raise (it may not — the deferred
-	 *  acknowledgment tells it the note is queued). Only these still-pending
-	 *  notes can be displaced by the guard; routed notes are never retracted. */
+	 *  order. Flushed deterministically at the next primary turn boundary (or the
+	 *  completed-update transition), so delivery does not depend on the advisor
+	 *  model choosing to re-raise (it may not — the deferred acknowledgment tells
+	 *  it the note is queued). Releasing at every boundary is what keeps the
+	 *  backlog from ageing into one terminal burst about steps the primary has
+	 *  already taken. Only these still-pending notes can be displaced by the
+	 *  guard; routed notes are never retracted. */
 	#deferredNotes: {
 		key: string;
 		note: string;
 		severity?: AdviseDetails["severity"];
-		turn?: number;
 	}[] = [];
 
 	/**
 	 * @param onAdvice Route an admitted note to the primary (channel selection +
-	 *   delivery). Never re-filters — the note already cleared the guard.
+	 *   delivery). Never re-filters — the note already cleared the guard. The
+	 *   third argument is set only for a withheld note, and names the release
+	 *   point that handed it over.
 	 * @param guard The admission authority: noise/empty/dedupe filter, rank-aware
 	 *   escalation, and the per-update non-blocker budget, decided the moment a
 	 *   note is emitted (live or deferred). Defaults to a stock
@@ -240,7 +273,11 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *   {@link ADVISOR_DEFAULT_BUDGET_PER_UPDATE}).
 	 */
 	constructor(
-		private readonly onAdvice: (note: string, severity: AdviseDetails["severity"] | undefined, turn?: number) => void,
+		private readonly onAdvice: (
+			note: string,
+			severity?: AdviseDetails["severity"],
+			delivery?: AdvisorAdviceDelivery,
+		) => void,
 		guard?: AdvisorEmissionGuard,
 	) {
 		this.#guard = guard ?? new AdvisorEmissionGuard();
@@ -255,24 +292,26 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 * was admitted when emitted, so the flush routes without re-admission and a
 	 * backlog of one note per originating update reaches the primary intact.
 	 */
-	beginUpdate(inProgress: boolean, coveredTurn?: number): void {
+	beginUpdate(inProgress: boolean): void {
 		const wasInProgress = this.#inProgressUpdate;
 		this.#inProgressUpdate = inProgress;
-		this.#coveredTurn = coveredTurn;
 		this.#guard.beginUpdate();
-		if (wasInProgress && !inProgress) this.#flushDeferred();
+		if (wasInProgress && !inProgress) this.#flushDeferred("terminal");
 	}
 
 	/**
 	 * Mark the primary no longer mid-turn and flush the withheld backlog
 	 * WITHOUT starting a new advisor update or resetting the guard's budget.
-	 * Called at the primary's terminal boundary (final yield), where no advisor
-	 * review follows but reserved notes must still reach the primary. Flushed
-	 * notes stay charged to their originating update as routed deliveries.
+	 * Called at a primary turn boundary, where reserved notes must still reach the
+	 * primary: `continuation` when the loop continues (the note rides an aside
+	 * into the run that is still going), `terminal` at the final yield, where no
+	 * advisor review follows and no further boundary will consume an aside.
+	 * Flushed notes stay charged to their originating update as routed
+	 * deliveries.
 	 */
-	flushDeferredNotes(): void {
+	flushDeferredNotes(release: AdvisorWithheldRelease = "terminal"): void {
 		this.#inProgressUpdate = false;
-		this.#flushDeferred();
+		this.#flushDeferred(release);
 	}
 
 	/** Clear all note state when the advisor starts a fresh conversation: the
@@ -282,6 +321,21 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		this.#guard.reset();
 		this.#inProgressUpdate = false;
 		this.#deferredNotes = [];
+	}
+
+	/**
+	 * Remove and return the withheld backlog in arrival order without routing it.
+	 * A caller that is about to reset or tear down the tool uses this to deliver
+	 * the notes itself: the advisor was told they are queued, so dropping them
+	 * here loses advice the primary will never be offered again. The guard's
+	 * dedupe and budget memory are untouched — a caller that resets afterwards
+	 * still gets the fresh conversation semantics from
+	 * {@link resetDeliveredNotes}.
+	 */
+	takeDeferredNotes(): { note: string; severity?: AdviseDetails["severity"] }[] {
+		const pending = this.#deferredNotes;
+		this.#deferredNotes = [];
+		return pending.map(({ note, severity }) => ({ note, severity }));
 	}
 
 	async execute(
@@ -316,7 +370,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				const displacedIndex = this.#deferredNotes.findIndex(item => item.key === decision.displacedKey);
 				if (displacedIndex !== -1) this.#deferredNotes.splice(displacedIndex, 1);
 			}
-			this.#deferredNotes.push({ key, note: args.note, severity: args.severity, turn: this.#coveredTurn });
+			this.#deferredNotes.push({ key, note: args.note, severity: args.severity });
 			return this.#result(ADVISOR_ACK_DEFERRED, args);
 		}
 		// Live path (completed update, or a blocker that must interrupt now). A
@@ -328,20 +382,26 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		if (reservedIndex !== -1) this.#deferredNotes.splice(reservedIndex, 1);
 		const decision = this.#guard.admit(args.note, { rank, pending: false });
 		if (!decision.accepted) return this.#suppressed(args, decision.reason);
-		this.onAdvice(args.note, args.severity, this.#coveredTurn);
+		this.onAdvice(args.note, args.severity);
 		return this.#result(ADVISOR_ACK_SENT, args);
 	}
 
 	/** Route every withheld note, oldest first, without re-admission — each was
 	 *  admitted when emitted. Routed notes are marked so their originating
 	 *  update's slots stay charged and can no longer be displaced. */
-	#flushDeferred(): void {
+	#flushDeferred(release: AdvisorWithheldRelease): void {
 		if (this.#deferredNotes.length === 0) return;
 		const pending = this.#deferredNotes;
 		this.#deferredNotes = [];
-		for (const { note, severity, turn } of pending) {
+		const delivery: AdvisorAdviceDelivery | undefined =
+			release === "continuation" ? { withheldInLiveRun: true } : undefined;
+		for (const { note, severity } of pending) {
 			this.#guard.markRouted(note);
-			this.onAdvice(note, severity, turn ?? this.#coveredTurn);
+			// The release tag rides only the continuation release: the terminal one
+			// keeps the two-argument live signature so a terminal flush is
+			// indistinguishable from an ordinary routed note.
+			if (delivery) this.onAdvice(note, severity, delivery);
+			else this.onAdvice(note, severity);
 		}
 	}
 

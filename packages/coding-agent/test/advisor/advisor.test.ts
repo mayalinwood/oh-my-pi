@@ -683,6 +683,31 @@ describe("advisor", () => {
 			expect(yq.has("advisor")).toBe(false);
 			expect(yq.has("normal")).toBe(true);
 		});
+
+		it("take(kind) hands queued entries to the caller instead of dropping them", () => {
+			// An advisor runtime rebuild must not silently swallow advice the primary
+			// never received: the entries leave the queue in the caller's hands, and
+			// only that kind's entries move.
+			const yq = new YieldQueue({
+				isStreaming: () => false,
+				injectIdle: async () => {},
+				scheduleIdleFlush: () => {},
+			});
+			yq.register<{ note: string }>("advisor", {
+				build: entries => (entries.length === 0 ? null : ({ role: "custom", content: "x" } as AgentMessage)),
+				skipIdleFlush: true,
+			});
+			yq.register<{ note: string }>("other", {
+				build: entries => (entries.length === 0 ? null : ({ role: "custom", content: "y" } as AgentMessage)),
+			});
+
+			yq.enqueue("advisor", { note: "released but not yet injected" });
+			yq.enqueue("other", { note: "unrelated" });
+
+			expect(yq.take("advisor")).toEqual([{ note: "released but not yet injected" }]);
+			expect(yq.has("advisor")).toBe(false);
+			expect(yq.has("other")).toBe(true);
+		});
 	});
 
 	describe("AdviseTool", () => {
@@ -695,7 +720,7 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "nit", undefined);
+			expect(onAdvice).toHaveBeenCalledWith(note, "nit");
 		});
 
 		it("allows the same advice after delivered-note memory resets", async () => {
@@ -708,8 +733,8 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(2);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit");
 		});
 
 		it("forwards escalations of an already-delivered note and suppresses downgrades", async () => {
@@ -725,9 +750,9 @@ describe("advisor", () => {
 			await tool.execute("tc-5", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
+			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker");
 		});
 
 		it("routes a same-text blocker escalation of an already-delivered note with the production guard", async () => {
@@ -772,7 +797,7 @@ describe("advisor", () => {
 
 			// Deferred notes are NOT delivered mid-turn; blocker still goes through.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker", undefined);
+			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker");
 			// The tool tells the advisor the note is deferred, not silently "Recorded.".
 			expect(JSON.stringify(deferred.content)).toContain("Queued for the end of the turn");
 
@@ -784,8 +809,8 @@ describe("advisor", () => {
 			// oldest first — no reliance on the advisor model re-raising them.
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
+			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit");
 
 			// A later explicit re-raise of the same note is deduped (already delivered).
 			await tool.execute("tc-4", { note, severity: "concern" });
@@ -805,7 +830,7 @@ describe("advisor", () => {
 			tool.beginUpdate(false);
 			// Identical note queued once, flushed once.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "concern", undefined);
+			expect(onAdvice).toHaveBeenCalledWith(note, "concern");
 		});
 
 		it("retains the highest severity when duplicate deferred advice escalates", async () => {
@@ -818,7 +843,7 @@ describe("advisor", () => {
 
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern", undefined);
+			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern");
 		});
 
 		it("flushes one deferred concern per update past the per-update emission budget on a late catch-up", async () => {
@@ -1108,6 +1133,43 @@ describe("advisor", () => {
 				{ note: "Nit held behind the turn.", severity: "nit" },
 				{ note: "Concern after the flush.", severity: "concern" },
 			]);
+		});
+
+		it("releases a withheld note at a continuing boundary as non-interrupting advice", async () => {
+			// A note withheld behind an in-progress turn describes work the primary
+			// has not finished. Releasing it only at the terminal boundary let a whole
+			// run's worth of notes accumulate and arrive as one burst about steps
+			// already taken. The continuing boundary is the first point where the
+			// primary is guaranteed to poll asides again, so the note is handed over
+			// there — and handed over tagged, because escalating to a steer there
+			// would hijack the very run the withholding protected.
+			const delivered: {
+				note: string;
+				severity?: string;
+				delivery?: { withheldInLiveRun?: boolean };
+			}[] = [];
+			const tool = new AdviseTool((note, severity, delivery) => delivered.push({ note, severity, delivery }));
+			const note = "Concern: the checkpoint guard drops the signed trailer.";
+
+			tool.beginUpdate(true);
+			await tool.execute("w-0", { note, severity: "concern" });
+			expect(delivered).toEqual([]);
+
+			tool.flushDeferredNotes("continuation");
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]?.note).toBe(note);
+			expect(delivered[0]?.severity).toBe("concern");
+			expect(delivered[0]?.delivery).toEqual({ withheldInLiveRun: true });
+
+			// A terminal release carries no continuation: the run is over and there
+			// is no further boundary to consume an aside, so the terminal policy owns
+			// the note (visible card) instead of parking it in the aside queue.
+			tool.beginUpdate(true);
+			await tool.execute("w-1", { note: "Nit: rename the helper.", severity: "nit" });
+			tool.flushDeferredNotes();
+			expect(delivered).toHaveLength(2);
+			expect(delivered[1]?.note).toBe("Nit: rename the helper.");
+			expect(delivered[1]?.delivery).toBeUndefined();
 		});
 
 		it("resetDeliveredNotes resets the guard and the pending backlog together", async () => {
@@ -6985,6 +7047,50 @@ describe("advisor", () => {
 				).toBe(channel);
 			},
 		);
+
+		it("keeps a note released inside a continuing run on the non-interrupting aside channel", () => {
+			// The withholding decision and the release point are different policies.
+			// A note released at a boundary where the primary is about to make
+			// another request must not re-escalate into the interrupting channel the
+			// withholding declined to use — that would hijack the run the deferral
+			// protected — and must not be preserved either, because the run is still
+			// going. A blocker is exempt: it never gets withheld, so it keeps the
+			// authority to interrupt.
+			for (const severity of ["nit", "concern", undefined] as const) {
+				expect(
+					resolveAdvisorDeliveryChannel({
+						severity,
+						continueSeverity: "nit",
+						autoResumeSuppressed: false,
+						streaming: false,
+						aborting: false,
+						withheldInLiveRun: true,
+					}),
+				).toBe("aside");
+			}
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "blocker",
+					continueSeverity: "nit",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					withheldInLiveRun: true,
+				}),
+			).toBe("steer");
+			// A headless drain that forbids primary turns still owns its notes.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					continueSeverity: "nit",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					preserveOnly: true,
+					withheldInLiveRun: true,
+				}),
+			).toBe("preserve");
+		});
 
 		it("preserves a terminal continuation blocked by stop suppression, preserveOnly, or the cooldown", () => {
 			const terminal = {

@@ -14,6 +14,7 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -1560,6 +1561,10 @@ describe("AgentSession advisor toggle", () => {
 			await advisorYielded.promise;
 			unsubscribe();
 
+			// The quota latch is a dispatch gate, not an advice gate: a note already
+			// admitted by the emission guard is still the primary's to receive. The
+			// release timing of a withheld note is covered by the delivery test
+			// below, so this case stays on quota classification alone.
 			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
 			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
 			adviseTool.beginUpdate(true);
@@ -1568,37 +1573,157 @@ describe("AgentSession advisor toggle", () => {
 				severity: "nit",
 			});
 			if (deferred.content.length === 0) throw new Error("Expected the advise tool to acknowledge the call");
-			// Behavior, not wording: a note deferred behind an in-progress turn
-			// holds only a reservation — it must stay out of the primary
-			// transcript until the terminal-boundary flush below releases it.
-			expect(
-				quotaSession.messages.some(message =>
-					JSON.stringify(message).includes("The final result still needs a regression test."),
-				),
-			).toBe(false);
-
-			// The quota latch prevents another advisor dispatch. The tool boundary
-			// must keep the note out of the continuing model request; terminal
-			// completion may then release it into the primary transcript.
-			await quotaSession.prompt("Complete another primary turn");
-			await quotaSession.waitForIdle();
-			const continuingCall = mock.calls[2];
-			if (!continuingCall) throw new Error("Expected primary continuation call");
-			expect(
-				continuingCall.context.messages.some(message =>
-					JSON.stringify(message).includes("The final result still needs a regression test."),
-				),
-			).toBe(false);
-			expect(
-				quotaSession.messages.some(
-					message =>
-						message.role === "custom" &&
-						typeof message.content === "string" &&
-						message.content.includes("The final result still needs a regression test."),
-				),
-			).toBe(true);
+			expect(quotaSession.getAdvisorStatusOverview().advisors[0]?.yielded).toBe(true);
 		} finally {
 			await quotaSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("delivers a withheld note to the primary inside the run that produced it", async () => {
+		// The deferral exists so a partial-work critique cannot interrupt a primary
+		// mid-plan. Holding the withheld notes until the terminal boundary made a
+		// whole run's worth of them arrive as one burst describing steps already
+		// taken — and, under the terminal-answer policy, as a visible card no turn
+		// ever consumed. The continuing boundary is the first point where the
+		// primary is guaranteed to poll asides again, so the note must land there.
+		const note = "Concern: the checkpoint guard drops the signed trailer.";
+		const mock = createMockModel({
+			responses: [
+				{ content: ["primary opening"] },
+				{
+					content: [{ type: "toolCall", id: "continuing-turn", name: "missing-tool", arguments: {} }],
+					stopReason: "toolUse",
+				},
+				{ content: ["primary still working"] },
+			],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const liveSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(liveSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = liveSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			// Complete each advisor review deterministically; no provider call.
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await liveSession.prompt("start the work");
+			await liveSession.waitForIdle();
+
+			// Emitted while the next run is in progress: reserved, not delivered.
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-concern", { note, severity: "concern" });
+			expect(liveSession.messages.some(message => JSON.stringify(message).includes(note))).toBe(false);
+
+			// That run continues past a tool step, so its boundary must release the
+			// note into the run itself.
+			await liveSession.prompt("keep going");
+			await liveSession.waitForIdle();
+			const continuedCall = mock.calls[2];
+			if (!continuedCall) throw new Error("Expected the primary to make a third request");
+			expect(continuedCall.context.messages.some(message => JSON.stringify(message).includes(note))).toBe(true);
+		} finally {
+			await liveSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("keeps a withheld note through an extension context refresh and a lifecycle teardown", async () => {
+		// Both rebuild paths used to drop advice the primary had never received: the
+		// extension context refresh cleared the tool's deferred backlog, and tearing
+		// the runtime down unhooked the aside dispatcher, which rejected every
+		// queued entry. A note the emission guard already admitted is the primary's
+		// to see, so it must survive both — released into the run by the refresh,
+		// and still visible after a teardown.
+		const refreshed = "Concern: the refresh dropped the withheld note.";
+		const torn = "Concern: the teardown dropped the withheld note.";
+		const mock = createMockModel({
+			responses: [{ content: ["primary opening"] }, { content: ["primary done"] }],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const keepSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(keepSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = keepSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await keepSession.prompt("start the work");
+			await keepSession.waitForIdle();
+
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-across-refresh", { note: refreshed, severity: "concern" });
+			const result = keepSession.ensureAdvisor({
+				enabled: true,
+				reason: "context refresh for the withheld-note contract",
+				idempotencyKey: "withheld-note-refresh",
+				resetMode: "context",
+			});
+			expect(result.outcome).toBe("unchanged");
+
+			await keepSession.prompt("keep going");
+			await keepSession.waitForIdle();
+			const secondCall = mock.calls[1];
+			if (!secondCall) throw new Error("Expected a second primary request");
+			expect(secondCall.context.messages.some(message => JSON.stringify(message).includes(refreshed))).toBe(true);
+
+			// A teardown is the other loss path: the note has no turn left to ride
+			// into, so it must survive as visible advice rather than vanish with the
+			// runtime it belonged to.
+			const liveTool = keepSession.getAdvisorAgent()?.state.tools.find(tool => tool.name === "advise");
+			if (!(liveTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+			liveTool.beginUpdate(true);
+			await liveTool.execute("withheld-across-teardown", { note: torn, severity: "concern" });
+			expect(keepSession.setAdvisorEnabled(false)).toBe(false);
+			expect(
+				keepSession.messages.some(message => message.role === "custom" && JSON.stringify(message).includes(torn)),
+			).toBe(true);
+		} finally {
+			await keepSession.dispose();
 			vi.restoreAllMocks();
 		}
 	});

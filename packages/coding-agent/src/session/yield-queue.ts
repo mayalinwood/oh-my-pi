@@ -199,6 +199,18 @@ export class YieldQueue {
 		return thunks;
 	}
 
+	/**
+	 * Remove and return one kind's queued entries in arrival order, leaving every
+	 * other kind — and the entry promises — untouched. A host that is about to
+	 * unhook a dispatcher uses this to hand the entries to a new owner instead of
+	 * letting {@link clear} or the unregister path reject them: advice the consumer
+	 * never received must not disappear with the dispatcher that was going to
+	 * deliver it.
+	 */
+	take<P>(kind: string): P[] {
+		return this.#drain(kind).map(entry => entry.value as P);
+	}
+
 	/** Drop queued entries. With `kind`, drop only that kind's entries (leaving
 	 *  any pending idle-flush for other kinds intact); otherwise drop everything. */
 	clear(kind?: string): void {

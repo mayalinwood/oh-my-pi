@@ -76,7 +76,7 @@ describe("advisor tool-call loop guard", () => {
 		advice?: string,
 		adviceSeverity: "nit" | "concern" | "blocker" = "nit",
 		advices?: { note: string; severity: "nit" | "concern" | "blocker" }[],
-	): { advisor: Agent; contexts: Context[]; reviewStarts: Context[] } {
+	): { advisor: Agent; contexts: Context[]; reviewStarts: Context[]; primaryMock: ReturnType<typeof createMockModel> } {
 		const primaryMock = createMockModel({
 			provider: "anthropic",
 			responses: [
@@ -182,7 +182,7 @@ describe("advisor tool-call loop guard", () => {
 		const advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to be active");
 		advisor.setModel(advisorMock);
-		return { advisor, contexts, reviewStarts };
+		return { advisor, contexts, reviewStarts, primaryMock };
 	}
 
 	it("redirects the advisor's own repeated tool call and reaches its next request", async () => {
@@ -661,6 +661,49 @@ describe("advisor tool-call loop guard", () => {
 					JSON.stringify(message.content).includes(note),
 			),
 		).toBe(true);
+	});
+
+	it("global strict catch-up releases when the review lands instead of idling to the 30s cap", async () => {
+		// Regression: the boundary parsed `advisor.syncBacklog: strict` with
+		// Number.parseInt (NaN) and capped the wait at 30s, so no waiter was ever
+		// notified by a completed review and every boundary stalled for the full
+		// cap. A strict wait has threshold 1, no deadline, and releases on catch-up.
+		const note = "Strict catch-up must deliver this before prompt() resolves.";
+		createAdvisor({ "advisor.syncBacklog": "strict" }, 0, undefined, 0, note);
+		if (!session) throw new Error("Expected live session");
+
+		const startedAt = Date.now();
+		await session.prompt("one update");
+		expect(Date.now() - startedAt).toBeLessThan(4_000);
+		const delivered = [...session.agent.state.messages, ...session.yieldQueue.drainLazy().map(build => build())];
+		expect(
+			delivered.some(message => message?.role === "custom" && JSON.stringify(message.content).includes(note)),
+		).toBe(true);
+	});
+
+	it("hands the newest ready note to the very next primary request, not one boundary later", async () => {
+		// Regression (off-by-one): a continuing boundary flushed the backlog BEFORE
+		// its own review ran, so the note that review produced while the strict
+		// catch-up wait was parked stayed withheld until the NEXT boundary. The
+		// primary then always lacked the freshest ready note ("up to the second to
+		// last"). The wait now ends with a second release, so the note rides into
+		// the request that follows the boundary it was reviewed at.
+		const note = "The freshest ready note must reach the next primary request.";
+		const { primaryMock } = createAdvisor({ "advisor.syncBacklog": "strict" }, 0, undefined, 2, note, "concern");
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("inspect two missing files");
+		// Two tool steps, so the primary makes three requests. The note is the
+		// product of the review that ran at boundary 1; it must already sit in the
+		// context of request 2, i.e. after exactly ONE assistant message. One
+		// boundary late it would follow two.
+		const messages = session.agent.state.messages;
+		const noteIndex = messages.findIndex(
+			message => message.role === "custom" && JSON.stringify(message.content).includes(note),
+		);
+		expect(noteIndex).toBeGreaterThan(-1);
+		expect(messages.slice(0, noteIndex).filter(message => message.role === "assistant")).toHaveLength(1);
+		expect(primaryMock.calls.length).toBeGreaterThanOrEqual(3);
 	});
 
 	it("resolves catch-up per advisor: a strict final reviewer waits while an off override never parks the boundary", async () => {

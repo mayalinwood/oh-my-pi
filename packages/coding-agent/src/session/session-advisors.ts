@@ -48,6 +48,7 @@ import {
 	ADVISOR_MAX_BUDGET_PER_UPDATE,
 	ADVISOR_SYNC_BACKLOG_MODES,
 	AdviseTool,
+	type AdvisorAdviceDelivery,
 	type AdvisorAgent,
 	type AdvisorReviewMode,
 	AdvisorEmissionGuard,
@@ -59,7 +60,7 @@ import {
 	AdvisorRuntime,
 	type AdvisorRuntimeStatus,
 	type AdvisorSeverity,
-type AdvisorStatus,
+	type AdvisorStatus,
 	type AdvisorStatusEntry,
 	type AdvisorSyncBacklog,
 	AdvisorTranscriptRecorder,
@@ -346,10 +347,6 @@ interface ActiveAdvisor {
 	syncBacklog: AdvisorSyncBacklog | undefined;
 	/** Eligible updates since the last reset; a review is scheduled at each multiple of the interval. */
 	eligibleUpdates: number;
-	/** Primary-turn count when the latest review was scheduled; the update that
-	 *  runs from it covers work up to this turn. Notes stamped with it so merged
-	 *  deliveries can show how many turns old each review was. */
-	pendingCoveredTurn: number;
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
 	/**
@@ -682,6 +679,14 @@ export class SessionAdvisors {
 			let scheduledAdvisors: ActiveAdvisor[] | undefined;
 			for (const advisor of this.#advisors) {
 				if (advisor.runtime.disposed) continue;
+				// Every primary boundary owns the deferred flush. Holding the
+				// backlog for the terminal one made a whole run's notes arrive as one
+				// burst describing steps already taken — and, under the terminal
+				// policy, as a visible card no turn consumes. A continuing turn is the
+				// first point where the primary is guaranteed to poll asides again, so
+				// the note is released there, still non-interruptingly. The flush never
+				// resets the per-update budget — no new advisor update starts here.
+				advisor.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
 				// Every advisor captures this boundary's delta now, while it matches
 				// what the primary saw: the per-turn prune that runs right after this
 				// callback may elide its tool results before a later review renders
@@ -695,7 +700,6 @@ export class SessionAdvisors {
 				if (scheduled) {
 					scheduledAdvisors ??= [];
 					scheduledAdvisors.push(advisor);
-					advisor.pendingCoveredTurn = this.#advisorPrimaryTurnsCompleted;
 				}
 				try {
 					advisor.runtime.onTurnEnd(messages, { willContinue, dispatch: scheduled });
@@ -703,7 +707,6 @@ export class SessionAdvisors {
 					logger.warn("advisor onTurnEnd threw; delta dropped", { advisor: advisor.name, err: String(error) });
 				}
 			}
-			if (!scheduledAdvisors) return;
 			// Catch-up policy resolves per advisor at each boundary: a roster
 			// entry's `syncBacklog` override wins; omitted entries follow the
 			// global `advisor.syncBacklog` setting live (a settings change needs
@@ -711,17 +714,43 @@ export class SessionAdvisors {
 			// are waited on, each under its own policy — a `strict` final reviewer
 			// blocks the boundary (no wall-clock cap; abort, failure, quota,
 			// transition, and disposal still release it) while an asynchronous
-			// turn reviewer never parks the primary.
-			const globalSyncBacklog = cfgAdvisorSyncBacklog.get(this.#host.settings);
-			const waits: Promise<boolean>[] = [];
-			for (const scheduled of scheduledAdvisors) {
-				const syncBacklog = scheduled.syncBacklog ?? globalSyncBacklog;
-				if (syncBacklog === "off") continue;
-				const strict = syncBacklog === "strict";
-				const threshold = strict ? 1 : Number.parseInt(syncBacklog, 10);
-				waits.push(scheduled.runtime.waitForCatchup(strict ? undefined : 30_000, threshold, signal));
+			// turn reviewer never parks the primary. The terminal sweep below must
+			// still run when no review was scheduled, so this is a guarded block
+			// and not an early return.
+			if (scheduledAdvisors) {
+				const globalSyncBacklog = cfgAdvisorSyncBacklog.get(this.#host.settings);
+				const waits: Promise<void>[] = [];
+				for (const scheduled of scheduledAdvisors) {
+					const syncBacklog = scheduled.syncBacklog ?? globalSyncBacklog;
+					if (syncBacklog === "off") continue;
+					const strict = syncBacklog === "strict";
+					const threshold = strict ? 1 : Number.parseInt(syncBacklog, 10);
+					waits.push(
+						scheduled.runtime.waitForCatchup(strict ? undefined : 30_000, threshold, signal).then(caughtUp => {
+							// The flush at the top of this callback ran BEFORE this boundary's
+							// own review, so a note that review emitted while we waited is
+							// still withheld (the update reviews a turn the primary is
+							// continuing). Left there it would ship one boundary late and the
+							// primary would always lack the newest ready note — delivery
+							// trailed review by exactly one step. Release it now, so it rides
+							// into the very next request. Only when the review actually
+							// landed: a deadline/abort/failure release leaves the review
+							// running, and re-arming its in-progress deferral is not ours to
+							// undo.
+							if (!caughtUp || scheduled.runtime.disposed) return;
+							const lateLoss = scheduled.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
+							if (lateLoss.dropped > 0) {
+								logger.info("advisor notes destroyed by the withheld backlog bound at a primary boundary", {
+									advisor: scheduled.name,
+									dropped: lateLoss.dropped,
+									peak: lateLoss.peak,
+								});
+							}
+						}),
+					);
+				}
+				await Promise.all(waits);
 			}
-			await Promise.all(waits);
 		} finally {
 			this.#advisorTerminalBoundaryOpen = false;
 			// Window closed: deliver everything buffered during flush + catch-up
@@ -983,7 +1012,7 @@ export class SessionAdvisors {
 	/** Tracks persistence of a visible advisor card emitted outside the primary loop. */
 	trackCardEvent(processing: Promise<void>): void {
 		this.#pendingAdvisorCardEvents.add(processing);
-		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
+		void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => { });
 	}
 
 	/** Waits for all advisor-card persistence handlers currently in flight. */
@@ -1174,6 +1203,11 @@ export class SessionAdvisors {
 				this.#advisorStatuses.set(slug, { name: config.name, status: "paused" });
 				continue;
 			}
+			// The roster-less default advisor carries no per-entry cadence and
+			// follows the live session settings. Patch 0001 split roster
+			// construction into `#advisorRoster()`, so the flag upstream read from
+			// the combined function is resolved locally here.
+			const legacy = !this.#advisorConfigs?.length;
 			// Roster entries default to every-turn review; the roster-less default
 			// advisor leaves both unset and follows the cadence settings live.
 			const reviewMode: AdvisorReviewMode | undefined = legacy
@@ -1185,8 +1219,8 @@ export class SessionAdvisors {
 			const reviewInterval = legacy
 				? undefined
 				: typeof configuredReviewInterval === "number" &&
-					  Number.isSafeInteger(configuredReviewInterval) &&
-					  configuredReviewInterval >= 1
+					Number.isSafeInteger(configuredReviewInterval) &&
+					configuredReviewInterval >= 1
 					? configuredReviewInterval
 					: 1;
 			// Catch-up override: schema-validated for WATCHDOG.yml entries, clamped
@@ -1195,7 +1229,7 @@ export class SessionAdvisors {
 			// "off" wins over a global strict/numeric policy.
 			const syncBacklog: AdvisorSyncBacklog | undefined =
 				config.syncBacklog !== undefined &&
-				(ADVISOR_SYNC_BACKLOG_MODES as readonly string[]).includes(config.syncBacklog)
+					(ADVISOR_SYNC_BACKLOG_MODES as readonly string[]).includes(config.syncBacklog)
 					? config.syncBacklog
 					: undefined;
 
@@ -1389,7 +1423,7 @@ export class SessionAdvisors {
 			// accepted notes and acknowledges truthfully. No separate accept wrapper.
 			const emissionGuard = new AdvisorEmissionGuard({ budgetPerUpdate });
 			const adviseTool = new AdviseTool(
-				(note, severity, turn) => this.#routeAdvice(advisorRef, note, severity, turn),
+				(note, severity, delivery) => this.#routeAdvice(advisorRef, note, severity, delivery),
 				emissionGuard,
 			);
 
@@ -1432,14 +1466,14 @@ export class SessionAdvisors {
 			// the UUIDv7 provider session id, not the local `-advisor` label.
 			const advisorTelemetry = this.#host.agent.telemetry
 				? {
-						...this.#host.agent.telemetry,
-						agent: {
-							id: advisorSessionLabel,
-							name: slug ? `${MODEL_ROLES.advisor.name}: ${advisorName}` : MODEL_ROLES.advisor.name,
-							description: formatModelString(advisorModel),
-						},
-						conversationId: undefined,
-					}
+					...this.#host.agent.telemetry,
+					agent: {
+						id: advisorSessionLabel,
+						name: slug ? `${MODEL_ROLES.advisor.name}: ${advisorName}` : MODEL_ROLES.advisor.name,
+						description: formatModelString(advisorModel),
+					},
+					conversationId: undefined,
+				}
 				: undefined;
 			// Mirror the SDK's provider-shaping options (streamFn/onPayload/...,
 			// providerSessionState, promptCacheKey, transformProviderContext) so each
@@ -1659,10 +1693,7 @@ export class SessionAdvisors {
 					// notes — both owned by the tool now. A queued WIP review may
 					// start after a terminal boundary flushed deferred notes; do not
 					// re-arm in-progress deferral.
-					advisorRef.adviseTool.beginUpdate(
-						inProgress && this.#advisorPrimaryWillContinue,
-						advisorRef.pendingCoveredTurn,
-					);
+					advisorRef.adviseTool.beginUpdate(inProgress && this.#advisorPrimaryWillContinue);
 				},
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
@@ -1733,7 +1764,6 @@ export class SessionAdvisors {
 				reviewInterval: descriptor.reviewInterval,
 				syncBacklog: descriptor.syncBacklog,
 				eligibleUpdates: carried?.get(slug)?.eligibleUpdates ?? 0,
-				pendingCoveredTurn: 0,
 				retryFallbackPendingSuccess: false,
 				providerWaitRetries: 0,
 				signature,
@@ -1764,6 +1794,7 @@ export class SessionAdvisors {
 								content: formatAdvisorBatchContent(entries),
 								details: { notes: entries } satisfies AdvisorMessageDetails,
 							} satisfies CustomMessage),
+						} satisfies CustomMessage),
 				skipIdleFlush: true,
 			});
 		}
@@ -1792,7 +1823,12 @@ export class SessionAdvisors {
 	 * admission — the note cleared the emission guard inside AdviseTool when it was
 	 * emitted, so a deferred flush replays the backlog without re-filtering.
 	 */
-	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity, turn?: number): void {
+	#routeAdvice(
+		advisor: ActiveAdvisor,
+		note: string,
+		severity?: AdvisorSeverity,
+		delivery?: AdvisorAdviceDelivery,
+	): void {
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
@@ -1810,12 +1846,22 @@ export class SessionAdvisors {
 				note,
 				severity,
 				advisor: source,
-				turn: turn ?? this.#advisorPrimaryTurnsCompleted,
+				turn: this.#advisorPrimaryTurnsCompleted,
 			});
 			return;
 		}
 		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
 		const terminalAnswerNoQueuedWork = this.#hasTerminalTextAnswerWithoutQueuedWork();
+		// A note released from the withheld backlog rides the loop it was withheld
+		// from, but only while that loop is still running: once it has stopped no
+		// step boundary is left to drain an aside, and a continuation would claim a
+		// session the user is about to prompt. It lands as a visible card instead,
+		// which re-enters context on the next primary request.
+		const liveLoop = this.#host.agent.state.isStreaming && !this.#preserveTerminalYieldAdvice;
+		if (delivery?.withheldInLiveRun && severity !== "blocker" && !liveLoop) {
+			this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), false);
+			return;
+		}
 		// A note that lands after the boundary window closed (catch-up off, or a
 		// review slower than its wait) gets exactly what the merged boundary flush
 		// would have granted it. The loop may still report streaming here, and an
@@ -1829,13 +1875,11 @@ export class SessionAdvisors {
 			continueSeverity: cfgAdvisorContinueSeverity.get(this.#host.settings),
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
 			preserveOnly: this.#preserveAdvisorAdvice,
-			// Key on the live agent-core loop, not session `isStreaming` (which also
-			// counts `#promptInFlightCount` during post-turn unwind). Only a running
-			// loop consumes a steer at its next boundary.
-			streaming: this.#host.agent.state.isStreaming && !this.#preserveTerminalYieldAdvice,
+			streaming: liveLoop,
 			aborting: this.#host.abortInProgress(),
 			terminalAnswerNoQueuedWork,
 			interruptImmuneTurnActive: this.#isAdvisorInterruptImmuneTurnActive(),
+			withheldInLiveRun: delivery?.withheldInLiveRun,
 		});
 		if (channel === "aside") {
 			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
@@ -1969,7 +2013,40 @@ export class SessionAdvisors {
 		}
 	}
 
+	/**
+	 * Hand advice the primary never received to one visible card. Used when the
+	 * advisor runtime goes away: there is no turn left to ride into, so the
+	 * honest outcome is advice the operator can read, not silence.
+	 */
+	#preserveStrandedNotes(notes: AdvisorNote[]): void {
+		if (notes.length === 0) return;
+		this.#host.preserveAdvisorCard({
+			role: "custom",
+			customType: "advisor",
+			content: formatAdvisorBatchContent(notes),
+			display: true,
+			attribution: "agent",
+			details: { notes } satisfies AdvisorMessageDetails,
+			timestamp: Date.now(),
+		});
+	}
+
+	/** Every note the live advisors still owe the primary: the withheld backlog
+	 *  plus whatever the aside dispatcher is holding, in that order. */
+	#collectStrandedNotes(): AdvisorNote[] {
+		return [
+			...this.#advisors.flatMap(a =>
+				a.adviseTool.takeDeferredNotes().map(note => ({ ...note, advisor: a.slug ? a.name : undefined })),
+			),
+			...this.#host.yieldQueue.take<AdvisorNote>("advisor"),
+		];
+	}
+
 	#stopAdvisorRuntime(): void {
+		// Advice the primary never saw must not die with the runtime: collect the
+		// withheld backlog and the queued asides BEFORE the dispatcher is unhooked,
+		// because unregistering rejects every entry still in the queue.
+		const stranded = this.#collectStrandedNotes();
 		// Detach each recorder feed BEFORE aborting its advisor agent: dispose() aborts
 		// the loop, and an abort emits a final `message_end` we must not enqueue against
 		// a closing recorder (it would reopen and resurrect an already-released file).
@@ -1983,10 +2060,11 @@ export class SessionAdvisors {
 			a.recorderClosed = a.recorder.close();
 			closes.push(a.recorderClosed);
 		}
-		this.#advisorRecorderClosed = Promise.all(closes).then(() => {});
+		this.#advisorRecorderClosed = Promise.all(closes).then(() => { });
 		this.#advisors = [];
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
+		this.#preserveStrandedNotes(stranded);
 	}
 
 	#recordAdvisorCost(advisor: ActiveAdvisor, message: AssistantMessage): void {
@@ -2143,11 +2221,11 @@ export class SessionAdvisors {
 		const message = assistantFailure?.errorMessage ?? (error instanceof Error ? error.message : String(error));
 		const errorId = assistantFailure
 			? AIError.classifyMessage({
-					api: currentModel.api,
-					errorId: assistantFailure.errorId,
-					errorMessage: message,
-					errorStatus: assistantFailure.errorStatus,
-				})
+				api: currentModel.api,
+				errorId: assistantFailure.errorId,
+				errorMessage: message,
+				errorStatus: assistantFailure.errorStatus,
+			})
 			: AIError.classify(error, currentModel.api);
 		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
 		// Text-ambiguous overflows waive the veto; usage-backed do not — see AIError.isTextAmbiguousContextOverflow (#9235).
@@ -3040,18 +3118,30 @@ export class SessionAdvisors {
 
 		if (resetMode === "context") {
 			const count = this.#host.agent.state.messages.length;
+			// The conversation continues across a context refresh, so a note the
+			// emission guard already admitted is still the primary's to receive.
+			// Collect the withheld notes before the tool forgets them and release
+			// them after the delivery state is cleared below — otherwise the reset
+			// drops the very advice it just made current.
+			const released: { advisor: ActiveAdvisor; note: string; severity?: AdvisorSeverity }[] = [];
 			for (const advisor of this.#advisors) {
 				if (!scopedSlugs.has(advisor.slug)) continue;
 				advisor.agentUnsubscribe?.();
 				advisor.agentUnsubscribe = undefined;
 				advisor.runtime.refreshContext(count, "extension-context-refresh");
 				advisor.providerWaitRetries = 0;
-				// The tool owns the emission guard and resets its deferred notes together.
+				for (const pending of advisor.adviseTool.takeDeferredNotes()) {
+					released.push({ advisor, note: pending.note, severity: pending.severity });
+				}
+				// The tool owns the emission guard and resets its dedupe memory here.
 				advisor.adviseTool.resetDeliveredNotes();
 				this.#attachAdvisorRecorderFeed(advisor);
 			}
 			this.#resetAdvisorDeliveryLatches();
 			this.#clearAdvisorDeliveryState();
+			for (const item of released) {
+				this.#routeAdvice(item.advisor, item.note, item.severity, { withheldInLiveRun: true });
+			}
 			this.#advisorGeneration++;
 			return remember("unchanged", request.reason.trim(), advisorNames, true);
 		}
@@ -3452,12 +3542,12 @@ export class SessionAdvisors {
 			options?.compact
 				? formatSessionHistoryMarkdown(a.agent.state.messages)
 				: formatSessionDumpText({
-						messages: a.agent.state.messages,
-						systemPrompt: a.agent.state.systemPrompt,
-						model: a.agent.state.model,
-						thinkingLevel: a.agent.state.thinkingLevel,
-						tools: a.agent.state.tools,
-					});
+					messages: a.agent.state.messages,
+					systemPrompt: a.agent.state.systemPrompt,
+					model: a.agent.state.model,
+					thinkingLevel: a.agent.state.thinkingLevel,
+					tools: a.agent.state.tools,
+				});
 		if (this.#advisors.length === 1) return dump(this.#advisors[0]);
 		return this.#advisors
 			.map(a => `### Advisor: ${a.name} (${a.agent.state.model.provider}/${a.agent.state.model.id})\n\n${dump(a)}`)
