@@ -689,7 +689,18 @@ export class SessionAdvisors {
 				// first point where the primary is guaranteed to poll asides again, so
 				// the note is released there, still non-interruptingly. The flush never
 				// resets the per-update budget — no new advisor update starts here.
-				advisor.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
+				const loss = advisor.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
+				// The bound is a resource limit, so its engagement must be nameable here
+				// and not only on the re-prime path: without this line the peak is
+				// computed, returned and read by nobody, and a boundary that coalesced a
+				// whole run's backlog leaves no operator-visible trace of the drop.
+				if (loss.dropped > 0) {
+					logger.info("advisor notes destroyed by the withheld backlog bound at a primary boundary", {
+						advisor: advisor.name,
+						dropped: loss.dropped,
+						peak: loss.peak,
+					});
+				}
 				// Every advisor captures this boundary's delta now, while it matches
 				// what the primary saw: the per-turn prune that runs right after this
 				// callback may elide its tool results before a later review renders
@@ -754,6 +765,26 @@ export class SessionAdvisors {
 					);
 				}
 				await Promise.all(waits);
+			}
+			if (!terminalBoundary) return;
+			// A note released at a continuing boundary assumes the primary polls
+			// asides again. The advisor queue is registered `skipIdleFlush`, so that
+			// assumption is the ONLY thing standing between the note and a session
+			// that goes idle still owing it: an idle queue is never drained, and the
+			// entry would wait for an arbitrary later prompt. A terminal release
+			// already owns this case by resolving to a visible card, so a note
+			// released early and stranded by the run ending gets the same treatment
+			// here. Doing it after the catch-up matters — a late review can enqueue
+			// asides of its own, and those are stranded by the same idle drain.
+			// Only once the loop has actually stopped. A terminal boundary can be
+			// reached while the primary is still streaming — the run unwinds there
+			// before it truly ends — and its next `drainLazy` is exactly what
+			// delivers a still-queued aside. Draining the queue into a static card
+			// there steals the note from a live run: it is delivered, but as a
+			// preserved card, so it never steers and the run it belonged to ends
+			// one boundary early.
+			if (!this.#host.agent.state.isStreaming) {
+				this.#preserveStrandedNotes(this.#collectStrandedNotes());
 			}
 		} finally {
 			this.#advisorTerminalBoundaryOpen = false;
