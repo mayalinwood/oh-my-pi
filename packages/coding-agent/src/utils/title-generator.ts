@@ -37,9 +37,9 @@ import { cfgRetryModelFallback } from "../session/settings";
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 const TITLE_MARKER_INSTRUCTION = prompt.render(titleMarkerInstruction);
 
-// Plain π, not the nerd-font `icon.omp` glyph: window/tab titles render in the
-// OS UI font, which has no nerd-font PUA coverage.
-const DEFAULT_TERMINAL_TITLE = "π";
+// Plain character, not the nerd-font `icon.omp` glyph: window/tab titles render
+// in the OS UI font, which has no nerd-font PUA coverage.
+const DEFAULT_TERMINAL_TITLE = "D";
 /** The native tab title without a session name. */
 const NATIVE_TERMINAL_TITLE = "omp";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
@@ -867,13 +867,13 @@ const terminalTitleRuntime: {
 };
 
 /**
- * Compose the terminal title from the `π` brand, a state-carrying separator, and
+ * Compose the terminal title from the Diamat `D` brand, a state-carrying separator, and
  * the session label. Pure (no I/O) so the state→separator contract is testable:
- *   - `idle` (user's turn):  `π > label`;
- *   - `working`:             `π ⠋ label` (static `π : label` under WSL, or on Windows once the native title path has failed);
- *   - `attention`:           `π ! label`;
- *   - disabled:              `π: label`.
- * Without a label the separator trails the brand (`π >`) so the state stays visible.
+ *   - `idle` (user's turn):  `D > label`;
+ *   - `working`:             `D ⠋ label` (static `D : label` under WSL, or on Windows once the native title path has failed);
+ *   - `attention`:           `D ! label`;
+ *   - disabled:              `D: label`.
+ * Without a label the separator trails the brand (`D >`) so the state stays visible.
  * The `working` separator cycles `TERMINAL_TITLE_SPINNER_STYLES[style]`; `style`
  * defaults to `braille` so existing 5-arg callers keep the historical frames.
  */
