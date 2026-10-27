@@ -1136,7 +1136,7 @@ export async function loadSessionExtensions(
 		loadOptions.deferStartupSafe && storage
 			? await partitionStartupExtensions(storage, paths, cwd)
 			: { eager: paths, deferred: [] };
-	const result = await logger.time("loadExtensions", loadExtensions, eager, cwd, eventBus);
+	const result = await logger.time("loadExtensions", loadExtensions, eager, cwd, eventBus, undefined, settings);
 	if (storage) await recordStartupVerdicts(storage, result.extensions);
 	for (const { path, error } of result.errors) {
 		logger.error("Failed to load extension", { path, error });
@@ -2811,13 +2811,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				preparedExtensions,
 				cwd,
 				eventBus,
+				undefined,
+				settings,
 			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to bind extension", { path, error });
 			}
 		} else if (options.preloadedExtensionPaths) {
 			extensionPaths = options.preloadedExtensionPaths;
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensions,
+				extensionPaths,
+				cwd,
+				eventBus,
+				undefined,
+				settings,
+			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -2825,7 +2835,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
 				discoverSessionExtensionPaths(options, cwd, settings),
 			);
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensions,
+				extensionPaths,
+				cwd,
+				eventBus,
+				undefined,
+				settings,
+			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -2854,7 +2872,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			for (let i = 0; i < inlineExtensions.length; i++) {
 				const factory = inlineExtensions[i];
 				const sourceId = `<inline-${nextInlineExtensionIndex++}>`;
-				const loaded = await loadExtensionFromFactory(factory, cwd, eventBus, extensionsResult.runtime, sourceId);
+				const loaded = await loadExtensionFromFactory(
+					factory,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+					sourceId,
+					settings,
+				);
 				extensionsResult.extensions.push(loaded);
 				if (i < rebindableInlineExtensionCount) {
 					extensionsResult.preparedExtensions ??= [];
@@ -2863,6 +2888,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						resolvedPath: sourceId,
 						factory,
 						error: null,
+						// Host-constructed: rebinding into a child session must not
+						// silently drop to deny-all.
+						trusted: true,
 					});
 				}
 			}
@@ -5642,6 +5670,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					cwd,
 					eventBus,
 					runtime,
+					settings,
 				);
 				const storage = settings.getStorage();
 				if (storage) await recordStartupVerdicts(storage, loaded.extensions);

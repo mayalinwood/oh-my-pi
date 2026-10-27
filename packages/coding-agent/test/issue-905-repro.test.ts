@@ -38,7 +38,8 @@ beforeAll(async () => {
 	shutdownPath = tmp.join("shutdown");
 	await fs.writeFile(
 		extPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider("test-gw", {
 		baseUrl: "https://example.com/v1",
 		apiKey: "literal-test-key",
@@ -58,7 +59,8 @@ beforeAll(async () => {
 	);
 	await fs.writeFile(
 		shutdownExtPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'events:subscribe' }];
+export default function (pi) {
 	pi.on("session_shutdown", async () => {
 		await Bun.write(${JSON.stringify(shutdownPath)}, "shutdown");
 	});
@@ -91,7 +93,8 @@ export default function () {}
 	);
 	await fs.writeFile(
 		tmp.join("explicit-package", "src", "main.ts"),
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider("explicit-gw", {
 		baseUrl: "https://explicit.example.com/v1",
 		apiKey: "literal-test-key",
@@ -111,7 +114,8 @@ export default function () {}
 	);
 	await fs.writeFile(
 		ambientExtPath,
-		`export default function (pi) {
+		`export const capabilities = [{ kind: 'provider:register' }];
+export default function (pi) {
 	pi.registerProvider("ambient-gw", {
 		baseUrl: "https://ambient.example.com/v1",
 		apiKey: "literal-test-key",

@@ -281,14 +281,14 @@ describe("persisted subagent revival", () => {
 		await Bun.write(blockedPath, "private fixture");
 		await Bun.write(
 			ownerExtension,
-			`export default function (pi) { pi.on("tool_call", event => {
+			`export const capabilities = [{ kind: "events:subscribe" }]; export default function (pi) { pi.on("tool_call", event => {
 				if (event.toolName === "read" && event.input.path === ${JSON.stringify(blockedPath)})
 					return { block: true, reason: "Owner policy denied the read" };
 			}); }\n`,
 		);
 		await Bun.write(
 			ambientExtension,
-			`export default function (pi) { pi.on("session_start", () => Bun.write(${JSON.stringify(ambientMarker)}, "ran")); }\n`,
+			`export const capabilities = [{ kind: "events:subscribe" }]; export default function (pi) { pi.on("session_start", () => Bun.write(${JSON.stringify(ambientMarker)}, "ran")); }\n`,
 		);
 		let extensionRoots: EffectiveExtensionRoots = {
 			explicit: [ambientExtension],
@@ -338,6 +338,9 @@ describe("persisted subagent revival", () => {
 			{
 				path: "<owner-policy>",
 				resolvedPath: "<owner-policy>",
+				// A prepared module is gated like any imported extension: it reaches
+				// only what it declares. This fixture registers a tool and hooks.
+				capabilities: [{ kind: "tools:register" }, { kind: "events:subscribe" }],
 				factory: pi => {
 					pi.registerTool({
 						name: "owner_policy_escalation",

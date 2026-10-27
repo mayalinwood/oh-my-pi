@@ -12,6 +12,9 @@ Extensions are the primary way to add capabilities to `omp`. A single extension 
 ```ts
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+// Only events are reached below, so that is all that gets declared.
+export const capabilities = [{ kind: "events:subscribe" }];
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify("My extension loaded!", "info");
@@ -21,12 +24,82 @@ export default function (pi: ExtensionAPI) {
 
 That is a working extension. Drop it into `~/.omp/agent/extensions/hello.ts` and restart omp to see the notification.
 
+## Declaring capabilities
+
+An extension loaded from a path declares every host power it uses, by exporting
+`capabilities` next to its default factory:
+
+```ts
+export const capabilities = [
+  { kind: "events:subscribe" }, // pi.on(...)
+  { kind: "tools:register" }, // pi.registerTool(...)
+  { kind: "ui:command" }, // pi.registerCommand(...)
+  { kind: "ui:shortcut" }, // pi.registerShortcut(...)
+  { kind: "session:message" }, // pi.sendMessage / pi.sendUserMessage
+];
+```
+
+- The declaration **defaults to empty**. An extension that declares nothing reaches no
+  gated member, even when its factory calls one.
+- A `kind` this runtime does not implement fails the load instead of being ignored.
+- Using an undeclared member throws `ExtensionCapabilityDenied`, naming the member and the
+  kind it needed, so the load fails with that name in its diagnostic.
+- `process:exec` is checked per invocation. `{ kind: "process:exec", command: "git", args: ["rev-parse", "--show-toplevel"] }`
+  authorises that one invocation — not `git push`, and not `bash`.
+- `pi.zod`, `pi.arktype`, `pi.typebox`, `pi.pi`, `pi.logger`, and `ctx.ui` are never gated.
+- Inline factories (`loadExtensionFromFactory`) and hook modules are **not** gated.
+
+The full member-to-capability table lives in the
+[extension authoring guide](../extensions.md#declaring-capabilities).
+
+## Declaring a manifest
+
+A path-loaded extension may also publish a `manifest` — what it *claims* about
+itself, written so a reviewer can read the claim without running the extension:
+
+```ts
+export const capabilities = [
+  { kind: "events:subscribe" }, // pi.on(...)
+  { kind: "ui:command" }, // pi.registerCommand(...)
+];
+
+// The same grants restated for review, in a different order.
+export const manifest = {
+  name: "acme-hello",
+  version: "1.0.0",
+  description: "Greets the session when it starts",
+  capabilities: [{ kind: "ui:command" }, { kind: "events:subscribe" }],
+};
+```
+
+- The shape is closed: `name` (a string matching `/^[a-z0-9][a-z0-9._-]*$/`),
+  `version` (a non-empty string the runtime never interprets), optional
+  `description`, and the optional `capabilities` mirror. Anything else fails the
+  load with `ExtensionManifestInvalid`, so the extension does not load at all.
+- Leaving the manifest out is fine — the extension then has no review identity,
+  the same way leaving out `capabilities` means no grants. Both default closed.
+- `name` is the review identity, so it must be unique among the loaded
+  extensions; a second extension claiming a taken name is refused.
+- `manifest.capabilities` is a **mirror, not the authority**. It is checked
+  against your `capabilities` export **by reach**: order does not matter, but
+  under- or over-declaring fails the load, so a manifest can never misstate what
+  the extension reaches.
+- Inline factories (`loadExtensionFromFactory`) and hook modules are outside both
+  mechanisms, exactly as they are outside the capability gate.
+
 ## Full example
 
 The following extension registers a slash command, a tool, and a session-start hook:
 
 ```ts
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+export const capabilities = [
+  { kind: "events:subscribe" },
+  { kind: "ui:command" },
+  { kind: "session:message" },
+  { kind: "tools:register" },
+];
 
 export default function myExtension(pi: ExtensionAPI) {
   const z = pi.zod;
@@ -139,6 +212,8 @@ Installed-plugin manifest entries may be `.ts`, `.js`, `.mjs`, or `.cjs`; a mani
 ## Registering commands
 
 ```ts
+export const capabilities = [{ kind: "ui:command" }, { kind: "session:write" }];
+
 pi.registerCommand("my-cmd", {
   description: "What the command does",
   handler: async (args, ctx) => {
@@ -172,6 +247,8 @@ Zod-compatible omptype builder; `pi.arktype` and the legacy-compatible
 `pi.typebox` are also available:
 
 ```ts
+export const capabilities = [{ kind: "tools:register" }];
+
 const z = pi.zod;
 
 pi.registerTool({
@@ -201,6 +278,8 @@ Tool definitions may also set `loadMode: "essential" | "discoverable"` (`"discov
 ## Subscribing to events
 
 ```ts
+export const capabilities = [{ kind: "events:subscribe" }];
+
 pi.on("tool_call", async (event, ctx) => {
   // event.toolName, event.input, event.toolCallId
   if (event.toolName !== "bash") return;
@@ -245,6 +324,8 @@ tail -f ~/.omp/logs/omp.$(date +%F).*.log
 
 Failed extension loads are logged with their path and error. Loaded extensions may also emit their own debug logs via `pi.logger`.
 
+A missing capability declaration surfaces here too: the load fails with `ExtensionCapabilityDenied`, naming the member and the kind it required.
+
 To temporarily disable a specific extension module by name without removing the file:
 
 ```yaml
@@ -257,6 +338,7 @@ The derived name is the filename stem (or directory name for `index.ts`-style en
 
 ## Important constraints
 
+- **Declare every host power you use.** An extension loaded from a path reaches only what its `capabilities` export declares, and that declaration defaults to empty. Using an undeclared member throws `ExtensionCapabilityDenied`; when the call happens during the factory run it fails the extension load. Hooks and inline factories (`loadExtensionFromFactory`) are not gated, and neither are `pi.zod`, `pi.arktype`, `pi.typebox`, `pi.pi`, `pi.logger`, or `ctx.ui`.
 - **Do not call runtime actions during load.** Methods like `pi.sendMessage()` throw `ExtensionRuntimeNotInitializedError` if called synchronously during module evaluation (before a session is active). Register handlers/tools/commands during load; perform runtime actions only from event handlers, tools, or commands.
 - **`tool_call` errors are fail-closed.** If a `tool_call` handler throws, the tool is blocked.
 - **Self-scheduled callbacks run in-process with no isolation.** A raw `setInterval`/`setTimeout`/detached-promise callback that throws escapes the handler-dispatch try/catch and crashes the whole session (`uncaughtException`). Use `ctx.setInterval` / `ctx.setTimeout` for background work — they contain callback throws and auto-clear on `session_shutdown`. With raw timers you must add your own `try/catch` and cleanup.

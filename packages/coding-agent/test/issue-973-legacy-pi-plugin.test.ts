@@ -37,7 +37,7 @@ describe("issue #973: legacy Pi plugin imports", () => {
 				'if (legacyRoot !== modernRoot) throw new Error("legacy root import did not remap");',
 				'if (legacyExtensions !== modernExtensions) throw new Error("legacy extension import did not remap");',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("legacy-pi-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),

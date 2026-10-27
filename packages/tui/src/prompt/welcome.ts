@@ -409,7 +409,7 @@ export class WelcomeComponent implements Component {
 }
 
 /** Block-grid brand mark shared by the welcome and setup surfaces. */
-export const PI_LOGO = ["████████████", "   ██  ██   ", "   ██  ██   ", "   ▒▒  ██   ", "       ██   "];
+export const PI_LOGO = ["  ███████▄   ", "  ██     ██  ", "  ██  ◆  ██  ", "  ██     ██  ", "  ███████▀   "];
 
 /** Columns of {@link PI_LOGO}. */
 const LOGO_WIDTH = Math.max(...PI_LOGO.map(row => row.length));
@@ -460,15 +460,17 @@ export function logoNode(lines: readonly string[], shimmer: boolean): NativeNode
 	);
 }
 
-/** Multi-stop palette for the diagonal gradient. */
+/** Grafana-inspired orange → yellow → pink → violet diagonal gradient. */
 const GRADIENT_STOPS: ReadonlyArray<readonly [number, number, number]> = [
-	[248, 79, 204], // oklch(0.7 0.24 340)
-	[147, 98, 244], // oklch(0.62 0.21 295)
-	[0, 219, 228], // oklch(0.81 0.14 200)
+	[255, 136, 51], // orange
+	[242, 204, 12], // yellow
+	[255, 120, 90], // coral transition
+	[255, 82, 134], // pink
+	[184, 119, 217], // violet
 ];
 
-/** 256-color ramp fallback when truecolor isn't available. */
-const GRADIENT_RAMP_256 = [206, 170, 134, 99, 69, 74, 44];
+/** 256-color approximation of the Grafana palette. */
+const GRADIENT_RAMP_256 = [208, 214, 220, 203, 198, 170, 141];
 
 /** Half-width of the shine highlight band, expressed in gradient-t units. */
 const SHINE_HALF_WIDTH = 0.18;

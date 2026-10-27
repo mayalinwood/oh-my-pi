@@ -35,6 +35,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { YAML } from "bun";
 
 describe("ExtensionRunner", () => {
 	let tempDir: TempDir;
@@ -72,14 +73,20 @@ describe("ExtensionRunner", () => {
 		tempDir.removeSync();
 	});
 
-	const loadTestExtensions = async (configuredPaths: string[] = []) => {
+	const loadTestExtensions = async (configuredPaths: string[] = [], settingsInstance?: Settings) => {
 		const discoveredPaths = fs
 			.readdirSync(extensionsDir, { withFileTypes: true })
 			.filter(entry => entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js")))
 			.map(entry => path.join(extensionsDir, entry.name))
 			.sort();
 		const explicitPaths = configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath));
-		const result = await loadExtensions([...discoveredPaths, ...explicitPaths], tempDir.path());
+		const result = await loadExtensions(
+			[...discoveredPaths, ...explicitPaths],
+			tempDir.path(),
+			undefined,
+			undefined,
+			settingsInstance,
+		);
 		const testRoots = [
 			extensionsDir,
 			...configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath)),
@@ -210,6 +217,7 @@ describe("ExtensionRunner", () => {
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+c", {
 						description: "Conflicts with built-in",
@@ -239,6 +247,7 @@ describe("ExtensionRunner", () => {
 
 		it("rejects ctrl+q so it cannot shadow the app.message.followUp default (#1903)", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+q", {
 						description: "Tries to bind the follow-up chord",
@@ -272,6 +281,7 @@ describe("ExtensionRunner", () => {
 
 		it("rejects Alt+M so it cannot shadow the app.model.select default", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("alt+m", {
 						description: "Tries to bind model select",
@@ -302,6 +312,7 @@ describe("ExtensionRunner", () => {
 		it("warns when two extensions register same shortcut", async () => {
 			// Use a non-reserved shortcut
 			const extCode1 = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+shift+x", {
 						description: "First extension",
@@ -310,6 +321,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'ui:shortcut' }];
 				export default function(pi) {
 					pi.registerShortcut("ctrl+shift+x", {
 						description: "Second extension",
@@ -343,6 +355,7 @@ describe("ExtensionRunner", () => {
 	describe("tool collection", () => {
 		it("collects tools from multiple extensions", async () => {
 			const toolCode = (name: string) => `
+				export const capabilities = [{ kind: 'tools:register' }];
 				export default function(pi) {
 					const { Type } = pi.typebox;
 					pi.registerTool({
@@ -375,6 +388,7 @@ describe("ExtensionRunner", () => {
 	describe("command collection", () => {
 		it("collects commands from multiple extensions", async () => {
 			const cmdCode = (name: string) => `
+				export const capabilities = [{ kind: 'ui:command' }];
 				export default function(pi) {
 					pi.registerCommand("${name}", {
 						description: "Test command",
@@ -401,6 +415,7 @@ describe("ExtensionRunner", () => {
 
 		it("prefers later-loaded explicit extensions for conflicting commands", async () => {
 			const deployCommand = (description: string) => `
+				export const capabilities = [{ kind: 'ui:command' }];
 				export default function(pi) {
 					pi.registerCommand("deploy", {
 						description: "${description}",
@@ -434,6 +449,7 @@ describe("ExtensionRunner", () => {
 	describe("error handling", () => {
 		it("rejects instead of returning untransformed context when its caller aborts a pending handler", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("context", async () => {
 						await new Promise(() => {});
@@ -459,6 +475,7 @@ describe("ExtensionRunner", () => {
 
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("context", async () => {
 						throw new Error("Handler error!");
@@ -493,6 +510,7 @@ describe("ExtensionRunner", () => {
 	describe("message renderers", () => {
 		it("gets message renderer by type", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:message-renderer' }];
 				export default function(pi) {
 					pi.registerMessageRenderer("my-type", (message, options, theme) => null);
 				}
@@ -517,6 +535,7 @@ describe("ExtensionRunner", () => {
 
 		it("collects assistant thinking renderers", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:thinking-renderer' }];
 				export default function(pi) {
 					pi.registerAssistantThinkingRenderer((context, theme) => null);
 				}
@@ -539,6 +558,7 @@ describe("ExtensionRunner", () => {
 	describe("flags", () => {
 		it("collects flags from extensions", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'ui:flag' }];
 				export default function(pi) {
 					pi.registerFlag("--my-flag", {
 						description: "My flag",
@@ -565,6 +585,7 @@ describe("ExtensionRunner", () => {
 	describe("assistant_message", () => {
 		it("chains text rewrites, ignores in-place edits, and preserves non-text blocks", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => {
 						event.message.content[0].text = "ignored";
@@ -610,6 +631,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-cursor.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({ content: event.message.content }));
 					pi.on("assistant_message", event => ({
@@ -652,6 +674,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-signatures.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({
 						content: [
@@ -738,7 +761,7 @@ describe("ExtensionRunner", () => {
 		] as const)("rejects %s topology or metadata changes", async (_case, content) => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-invalid.ts"),
-				`export default pi => pi.on("assistant_message", () => ({ content: ${JSON.stringify(content)} }));`,
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default pi => pi.on("assistant_message", () => ({ content: ${JSON.stringify(content)} }));`,
 			);
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
@@ -769,6 +792,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-abort.ts"),
 				`
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("assistant_message", event => ({
 						content: event.message.content.map(block =>
@@ -806,7 +830,7 @@ describe("ExtensionRunner", () => {
 		it("rejects attempts to change tool calls", async () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "assistant-message-invalid.ts"),
-				`export default pi => pi.on("assistant_message", () => ({ content: [{ type: "text", text: "lost tool" }] }));`,
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default pi => pi.on("assistant_message", () => ({ content: [{ type: "text", text: "lost tool" }] }));`,
 			);
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
@@ -838,6 +862,7 @@ describe("ExtensionRunner", () => {
 			if (!primaryModel || !requestModel) throw new Error("Expected bundled cross-provider models to exist");
 
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'model:read' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (_event, ctx) => {
 						const current = ctx.models.current();
@@ -906,6 +931,7 @@ describe("ExtensionRunner", () => {
 
 		it("chains payload replacements across handlers in load order", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { chain?: string[] };
@@ -914,6 +940,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { chain?: string[] };
@@ -939,6 +966,7 @@ describe("ExtensionRunner", () => {
 
 		it("keeps chaining after handler errors", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async () => {
 						throw new Error("payload failed");
@@ -946,6 +974,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("before_provider_request", async (event) => {
 						const payload = event.payload as { preserved?: boolean };
@@ -983,6 +1012,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 			import * as fs from "node:fs";
 
+			export const capabilities = [{ kind: 'events:subscribe' }];
 			export default function(pi) {
 				pi.on("after_provider_response", async (event) => {
 					fs.appendFileSync(
@@ -1058,6 +1088,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'model:read' }];
 				export default function(pi) {
 					pi.on("after_provider_response", async (_event, ctx) => {
 						const current = ctx.models.current();
@@ -1130,6 +1161,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 			import * as fs from "node:fs";
 
+			export const capabilities = [{ kind: 'events:subscribe' }];
 			export default function(pi) {
 				pi.on("session_stop", async (event) => {
 					fs.appendFileSync(
@@ -1212,6 +1244,7 @@ describe("ExtensionRunner", () => {
 				`
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_stop", async () => {
 						fs.writeFileSync(${JSON.stringify(startedPath)}, "started");
@@ -1284,6 +1317,7 @@ describe("ExtensionRunner", () => {
 			await Bun.write(
 				extensionPath,
 				`
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:abort' }];
 				export default function(pi) {
 					pi.on("session_stop", async (_event, ctx) => {
 						ctx.abort();
@@ -1358,6 +1392,7 @@ describe("ExtensionRunner", () => {
 			await Bun.write(
 				path.join(extensionsDir, "session-stop-precedence.ts"),
 				`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_stop", async () => ({ continue: true, additionalContext: "Earlier advisory." }));
 					pi.on("session_stop", async () => ({ decision: "block", reason: "Continue from second handler." }));
@@ -1408,6 +1443,7 @@ describe("ExtensionRunner", () => {
 	describe("tool_result chaining", () => {
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) => {
 						return {
@@ -1417,6 +1453,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) => {
 						return {
@@ -1461,6 +1498,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves previous modifications when later handlers return partial patches", async () => {
 			const extCode1 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async () => {
 						return {
@@ -1471,6 +1509,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const extCode2 = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", async () => {
 						return {
@@ -1555,6 +1594,7 @@ describe("ExtensionRunner", () => {
 
 		it("surfaces replacement content while keeping the call an error", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
@@ -1575,6 +1615,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves the original exception when no handler modifies the result", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", () => {});
 				}
@@ -1587,6 +1628,7 @@ describe("ExtensionRunner", () => {
 
 		it("converts a failure to success when a handler clears isError", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => {
 						if (!event.isError) return;
@@ -1602,6 +1644,7 @@ describe("ExtensionRunner", () => {
 
 		it("marks a successful result as an error when a handler sets isError", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", () => ({
 						content: [{ type: "text", text: "now failing" }],
@@ -1617,6 +1660,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves a tool-reported error through extension rewrites", async () => {
 			const runner = await runnerFor(`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_result", (event) => ({
 						content: [{ type: "text", text: event.isError ? "observed failure" : "observed success" }],
@@ -1670,6 +1714,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				hangExtensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("session_start", async () => {
 							await Promise.withResolvers().promise;
@@ -1682,6 +1727,7 @@ describe("ExtensionRunner", () => {
 				`
 					import * as fs from "node:fs";
 
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("session_start", async () => {
 							fs.appendFileSync(${JSON.stringify(markerPath)}, "fast\\n");
@@ -1733,6 +1779,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						pi.on("session_shutdown", () => {
 							const { Type } = pi.typebox;
@@ -1781,6 +1828,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				hangExtensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async () => {
 							await Promise.withResolvers().promise;
@@ -1850,6 +1898,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async () => {
 							await Promise.withResolvers().promise;
@@ -1916,6 +1965,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						pi.on("tool_call", () => {
 							const { Type } = pi.typebox;
@@ -1979,6 +2029,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'tools:register' }];
 					export default function(pi) {
 						const { Type } = pi.typebox;
 						pi.registerTool({
@@ -2029,6 +2080,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							ctx.ui.notify("Waiting for confirmation");
@@ -2141,6 +2193,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							await ctx.ui.custom(async () => {
@@ -2211,6 +2264,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(
 				extensionPath,
 				`
+					export const capabilities = [{ kind: 'events:subscribe' }];
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							await ctx.ui.confirm("High-risk command", "Allow this command?");
@@ -2275,6 +2329,7 @@ describe("ExtensionRunner", () => {
 	describe("memory context", () => {
 		it("exposes the lazy memory runtime after initialization", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("session_start", async (_event, ctx) => {
 						globalThis.__ompMemoryStatus = await ctx.memory.status();
@@ -2346,6 +2401,7 @@ describe("ExtensionRunner", () => {
 	describe("service tier API", () => {
 		it("returns a detached snapshot, forwards valid changes, and rejects invalid family tiers", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:append' }, { kind: 'model:read' }, { kind: 'model:write' }];
 				export default function(pi) {
 					pi.on("session_start", () => {
 						const tiers = pi.getServiceTiers();
@@ -2427,9 +2483,376 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("extension settings section API", () => {
+		const extensionSource = `
+			export const capabilities = [{ kind: 'settings:register' }];
+			export default function(pi) {
+				const fields = [
+					{ key: "enabled", label: "Enabled", description: "Enable review.", type: "boolean", default: true },
+					{ key: "maxReviews", label: "Maximum reviews", description: "Bounded count.", type: "integer", min: 1, max: 100, default: 24 },
+					{ key: "costCutoffUsd", label: "Cost cutoff", description: "Finite USD cutoff.", type: "number", min: 0, max: 1, default: 1 },
+					{ key: "requiredRisk", label: "Required risk", description: "Required risk level.", type: "enum", values: ["low", "medium", "high"], default: "high" },
+					{ key: "reviewer", label: "Reviewer", description: "Stable name or automatic.", type: "text", minLength: 1, maxLength: 64, pattern: "automatic|[A-Za-z0-9][A-Za-z0-9._-]{0,63}", default: "automatic" },
+				];
+				const definition = {
+					id: "review-policy",
+					label: "Review policy",
+					description: "Bounded review admission.",
+					fields,
+					getStatus: () => [
+						{ label: "Reviewer status", value: globalThis.__extensionSettingsLive ?? "idle" },
+					],
+				};
+				const snapshot = pi.registerSettingsSection(definition);
+				definition.id = "redirected-policy";
+				definition.fields = [];
+				definition.getStatus = () => [{ label: "Mutated status", value: "wrong" }];
+				fields[1].key = "redirectedKey";
+				fields[1].default = 99;
+				globalThis.__extensionSettingsSnapshot = snapshot;
+				globalThis.__extensionSettingsSnapshotFrozen = Object.isFrozen(snapshot);
+			}
+		`;
+
+		it("returns defaults, accepts inclusive bounds, persists project values, and keeps the startup snapshot immutable", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const projectConfigPath = path.join(tempDir.path(), ".omp", "config.yml");
+			fs.mkdirSync(path.dirname(projectConfigPath), { recursive: true });
+			fs.writeFileSync(
+				projectConfigPath,
+				YAML.stringify(
+					{
+						extensionSettings: {
+							"review-policy": {
+								enabled: false,
+								maxReviews: 100,
+								costCutoffUsd: 0,
+								requiredRisk: "low",
+								reviewer: "Security",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+			const settingsInstance = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "agent"),
+			});
+			const globalState = globalThis as typeof globalThis & {
+				__extensionSettingsLive?: string;
+				__extensionSettingsSnapshot?: unknown;
+				__extensionSettingsSnapshotFrozen?: boolean;
+			};
+			globalState.__extensionSettingsLive = "running";
+
+			const loaded = await loadTestExtensions([extensionPath], settingsInstance);
+			expect(loaded.errors).toEqual([]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				settingsInstance,
+			);
+			const [section] = runner.getSettingsSections();
+			expect(section).toBeDefined();
+			expect(globalState.__extensionSettingsSnapshotFrozen).toBe(true);
+			expect(globalState.__extensionSettingsSnapshot).toEqual({
+				enabled: false,
+				maxReviews: 100,
+				costCutoffUsd: 0,
+				requiredRisk: "low",
+				reviewer: "Security",
+			});
+			expect(section?.getStatus()).toEqual([{ label: "Reviewer status", value: "running", description: undefined }]);
+			expect(section?.id).toBe("review-policy");
+			expect(section?.fields.map(field => field.key)).toEqual([
+				"enabled",
+				"maxReviews",
+				"costCutoffUsd",
+				"requiredRisk",
+				"reviewer",
+			]);
+			expect(Object.isFrozen(section)).toBe(true);
+			expect(Object.isFrozen(section?.fields)).toBe(true);
+			expect(section?.fields.every(field => Object.isFrozen(field))).toBe(true);
+
+			section?.setValue("maxReviews", 1);
+			section?.setValue("costCutoffUsd", 1);
+			section?.setValue("reviewer", "automatic");
+			expect(section?.readValues()).toMatchObject({ maxReviews: 1, costCutoffUsd: 1, reviewer: "automatic" });
+			expect(section?.isRestartRequired()).toBe(true);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({
+				maxReviews: 100,
+				costCutoffUsd: 0,
+				reviewer: "Security",
+			});
+			await settingsInstance.flush();
+
+			const persisted = YAML.parse(fs.readFileSync(projectConfigPath, "utf8")) as {
+				extensionSettings: Record<string, Record<string, unknown>>;
+			};
+			expect(persisted.extensionSettings["review-policy"]).toMatchObject({
+				maxReviews: 1,
+				costCutoffUsd: 1,
+				reviewer: "automatic",
+			});
+			expect(fs.readFileSync(projectConfigPath, "utf8")).not.toContain("Reviewer status");
+
+			const readbackSettings = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "readback-agent"),
+			});
+			const readback = await loadExtensions([extensionPath], tempDir.path(), undefined, undefined, readbackSettings);
+			expect(readback.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({
+				maxReviews: 1,
+				costCutoffUsd: 1,
+				reviewer: "automatic",
+			});
+
+			const defaultsRoot = path.join(tempDir.path(), "defaults");
+			fs.mkdirSync(defaultsRoot, { recursive: true });
+			const defaultSettings = await Settings.loadIsolated({
+				cwd: defaultsRoot,
+				agentDir: path.join(defaultsRoot, "agent"),
+			});
+			const defaults = await loadExtensions([extensionPath], defaultsRoot, undefined, undefined, defaultSettings);
+			expect(defaults.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toEqual({
+				enabled: true,
+				maxReviews: 24,
+				costCutoffUsd: 1,
+				requiredRisk: "high",
+				reviewer: "automatic",
+			});
+
+			const autoScopedRoot = path.join(tempDir.path(), "auto-scoped");
+			const autoScopedConfig = path.join(autoScopedRoot, ".omp", "config.yml");
+			fs.mkdirSync(path.dirname(autoScopedConfig), { recursive: true });
+			fs.writeFileSync(
+				autoScopedConfig,
+				YAML.stringify({ extensionSettings: { "review-policy": { maxReviews: 7 } } }, null, 2),
+			);
+			const autoScoped = await loadExtensions([extensionPath], autoScopedRoot);
+			expect(autoScoped.errors).toEqual([]);
+			expect(globalState.__extensionSettingsSnapshot).toMatchObject({ maxReviews: 7 });
+		});
+
+		it("rejects each malformed section atomically instead of weakening defaults", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section-invalid.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const invalidSections: unknown[] = [
+				{ maxReviews: 0 },
+				{ maxReviews: 101 },
+				{ maxReviews: 1.5 },
+				{ costCutoffUsd: "0.5" },
+				{ requiredRisk: "urgent" },
+				{ reviewer: "Security reviewer" },
+				{ reviewer: "Security\n" },
+				{ unknownPolicyKey: true },
+			];
+			const globalState = globalThis as typeof globalThis & { __extensionSettingsSnapshot?: unknown };
+
+			for (let index = 0; index < invalidSections.length; index++) {
+				const cwd = path.join(tempDir.path(), `invalid-${index}`);
+				const configPath = path.join(cwd, ".omp", "config.yml");
+				fs.mkdirSync(path.dirname(configPath), { recursive: true });
+				fs.writeFileSync(
+					configPath,
+					YAML.stringify({ extensionSettings: { "review-policy": invalidSections[index] } }, null, 2),
+				);
+				const settingsInstance = await Settings.loadIsolated({
+					cwd,
+					agentDir: path.join(cwd, "agent"),
+				});
+				globalState.__extensionSettingsSnapshot = "registration-rejected";
+				const loaded = await loadExtensions([extensionPath], cwd, undefined, undefined, settingsInstance);
+
+				expect(loaded.extensions).toEqual([]);
+				expect(loaded.errors).toHaveLength(1);
+				expect(loaded.errors[0]?.error).toContain("Failed to load extension");
+				expect(globalState.__extensionSettingsSnapshot).toBe("registration-rejected");
+			}
+		});
+
+		it("rejects duplicate section ids from distinct extension instances even when their diagnostic paths match", async () => {
+			const extensionPath = path.join(tempDir.path(), "settings-section-duplicate.ts");
+			fs.writeFileSync(extensionPath, extensionSource);
+			const settingsInstance = await Settings.loadIsolated({
+				cwd: tempDir.path(),
+				agentDir: path.join(tempDir.path(), "duplicate-agent"),
+			});
+
+			const loaded = await loadExtensions(
+				[extensionPath, extensionPath],
+				tempDir.path(),
+				undefined,
+				undefined,
+				settingsInstance,
+			);
+
+			expect(loaded.extensions).toHaveLength(1);
+			expect(loaded.errors).toHaveLength(1);
+			expect(loaded.errors[0]?.error).toContain('Extension settings section "review-policy" is already registered');
+		});
+	});
+
+	describe("advisor lifecycle API", () => {
+		it("delegates content-free status and control requests through the loaded extension API", async () => {
+			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'advisor:read' }, { kind: 'advisor:lease' }];
+				export default function(pi) {
+					pi.on("session_start", () => {
+						globalThis.__advisorLifecycleApi = {
+							status: pi.getAdvisorStatus(),
+							result: pi.ensureAdvisor({
+								enabled: true,
+								reason: "deterministic policy",
+								idempotencyKey: "review-1",
+								resetMode: "context",
+							}),
+						};
+					});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "advisor-lifecycle.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+			const globalState = globalThis as typeof globalThis & { __advisorLifecycleApi?: unknown };
+			delete globalState.__advisorLifecycleApi;
+			const requests: unknown[] = [];
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					getAdvisorStatus: () => ({
+						generation: 4,
+						configured: true,
+						enabled: true,
+						active: true,
+						advisors: [
+							{
+								name: "Security",
+								status: "running",
+								active: true,
+								model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+								configuredToolNames: ["read", "grep"],
+							},
+						],
+						tokens: 42,
+						cost: 0.25,
+					}),
+					ensureAdvisor: request => {
+						requests.push(request);
+						return {
+							outcome: "unchanged" as const,
+							reason: request.reason,
+							generation: 5,
+							idempotent: false,
+							resetApplied: true,
+							enabled: true,
+							active: true,
+							advisors: ["Security"],
+						};
+					},
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(requests).toEqual([
+				{
+					enabled: true,
+					reason: "deterministic policy",
+					idempotencyKey: "review-1",
+					resetMode: "context",
+				},
+			]);
+			expect(globalState.__advisorLifecycleApi).toEqual({
+				status: {
+					generation: 4,
+					configured: true,
+					enabled: true,
+					active: true,
+					advisors: [
+						{
+							name: "Security",
+							status: "running",
+							active: true,
+							model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+							configuredToolNames: ["read", "grep"],
+						},
+					],
+					tokens: 42,
+					cost: 0.25,
+				},
+				result: {
+					outcome: "unchanged",
+					reason: "deterministic policy",
+					generation: 5,
+					idempotent: false,
+					resetApplied: true,
+					enabled: true,
+					active: true,
+					advisors: ["Security"],
+				},
+			});
+			delete globalState.__advisorLifecycleApi;
+		});
+
+		it("keeps Advisor actions unavailable during extension load", async () => {
+			const explicitExtensionPath = path.join(tempDir.path(), "advisor-lifecycle-load.ts");
+			fs.writeFileSync(
+				explicitExtensionPath,
+				`export const capabilities = [{ kind: 'advisor:read' }]; export default function(pi) { pi.getAdvisorStatus(); }`,
+			);
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const loadError = result.errors.find(error => error.path.includes("advisor-lifecycle-load.ts"));
+
+			expect(loadError?.error).toContain("Extension runtime not initialized");
+		});
+	});
+
 	describe("session name API", () => {
 		it("lets extensions read and set the session name after initialization", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }, { kind: 'session:read' }, { kind: 'session:write' }];
 				export default function(pi) {
 					pi.on("session_start", async () => {
 						if (pi.getSessionName() !== undefined) {
@@ -2488,6 +2911,7 @@ describe("ExtensionRunner", () => {
 
 		it("keeps session naming unavailable during extension load", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'session:read' }];
 				export default function(pi) {
 					pi.getSessionName();
 				}
@@ -2579,6 +3003,7 @@ describe("ExtensionRunner", () => {
 		it("emits requested before waiting and resolved after approval", async () => {
 			const events: Array<{ type: string; approved?: boolean }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__approvalEvents.push({ type: event.type });
@@ -2786,6 +3211,7 @@ describe("ExtensionRunner", () => {
 		it("emits resolved false when approval is denied", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__deniedApprovalEvents.push({ type: event.type, reason: event.reason });
@@ -2835,6 +3261,7 @@ describe("ExtensionRunner", () => {
 		it("emits resolved false when the approval prompt throws", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__thrownApprovalEvents.push({ type: event.type, reason: event.reason });
@@ -2886,6 +3313,7 @@ describe("ExtensionRunner", () => {
 		it("emits lifecycle events when partial context has no session manager", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string; sessionId?: string }> = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_approval_requested", async (event) => {
 						globalThis.__partialContextApprovalEvents.push({
@@ -2959,6 +3387,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3023,6 +3452,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3062,6 +3492,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3102,6 +3533,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "edit") return;
@@ -3164,6 +3596,7 @@ describe("ExtensionRunner", () => {
 		it("executes the tool with a non-blocking handler's replacement input", async () => {
 			const recordPath = path.join(tempDir.path(), "override-executed.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3203,6 +3636,7 @@ describe("ExtensionRunner", () => {
 		it("ignores a replacement input when the handler also blocks", async () => {
 			const recordPath = path.join(tempDir.path(), "override-blocked.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3294,6 +3728,7 @@ describe("ExtensionRunner", () => {
 		it("blocks a revised input that resolves to a deny policy (approval gates the revised args)", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-blocked.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3325,6 +3760,7 @@ describe("ExtensionRunner", () => {
 		it("allows a revised input that still passes policy", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-allowed.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3357,6 +3793,7 @@ describe("ExtensionRunner", () => {
 		it("uses the last handler's input when several handlers set it", async () => {
 			const recordPath = path.join(tempDir.path(), "regate-multi.jsonl");
 			const first = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3365,6 +3802,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3398,6 +3836,7 @@ describe("ExtensionRunner", () => {
 
 		it("preserves distinct additional context from every non-blocking handler in registration order", async () => {
 			const first = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({
 						input: { command: "echo first" },
@@ -3407,6 +3846,7 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "second context" }));
 					pi.on("tool_call", async () => ({ additionalContext: "first context" }));
@@ -3439,12 +3879,14 @@ describe("ExtensionRunner", () => {
 
 		it("preserves additional context from every tool_result handler in registration order", async () => {
 			const first = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "first result context" }));
 					pi.on("tool_result", async () => ({ additionalContext: "   " }));
 				}
 			`;
 			const second = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "second result context" }));
 				}
@@ -3477,7 +3919,7 @@ describe("ExtensionRunner", () => {
 		it("keeps an earlier extension's redaction when a later one returns only repeated context", async () => {
 			fs.writeFileSync(
 				path.join(extensionsDir, "tool-result-redact-a.ts"),
-				`export default function(pi) {
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 					pi.on("tool_result", async () => ({
 						content: [{ type: "text", text: "token [REDACTED]" }],
 						additionalContext: "use the redacted result",
@@ -3486,7 +3928,7 @@ describe("ExtensionRunner", () => {
 			);
 			fs.writeFileSync(
 				path.join(extensionsDir, "tool-result-redact-b.ts"),
-				`export default function(pi) {
+				`export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 					pi.on("tool_result", async () => ({ additionalContext: "use the redacted result  " }));
 				}`,
 			);
@@ -3520,6 +3962,7 @@ describe("ExtensionRunner", () => {
 
 		it("forwards failure-specific tool_result context through the tool context", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: "events:subscribe" }];
 				export default function(pi) {
 					pi.on("tool_result", async (event) =>
 						event.isError ? { additionalContext: "inspect the failure before retrying" } : undefined);
@@ -3567,6 +4010,7 @@ describe("ExtensionRunner", () => {
 
 		it("forwards passive context from wrapper-dispatched calls through the tool context", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "nested device context" }));
 				}
@@ -3599,6 +4043,7 @@ describe("ExtensionRunner", () => {
 
 		it("discards collected additional context when a later handler blocks", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ additionalContext: "must not leak" }));
 					pi.on("tool_call", async () => ({ block: true, reason: "blocked" }));
@@ -3630,6 +4075,7 @@ describe("ExtensionRunner", () => {
 			// approval gate. Forwarding waits for approval: an approved call
 			// delivers, a denied call throws before anything is injected.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -3699,6 +4145,7 @@ describe("ExtensionRunner", () => {
 			// on policy alone would let the revised args run under approval granted for the original.
 			// Because tool_call fires before the approval gate, the prompt must reflect the revised args.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -3761,6 +4208,7 @@ describe("ExtensionRunner", () => {
 			// still emits.
 			const recordPath = path.join(tempDir.path(), "loop-marker.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3800,6 +4248,7 @@ describe("ExtensionRunner", () => {
 			// (here: no interactive UI => reject) instead of riding the outer approval.
 			const recordPath = path.join(tempDir.path(), "xdev-revised.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3835,6 +4284,7 @@ describe("ExtensionRunner", () => {
 		] as const)("forfeits ACP approval after in-place input mutation %s", async (_case, returnsInput) => {
 			const recordPath = path.join(tempDir.path(), `acp-mutated-${returnsInput}.jsonl`);
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3868,6 +4318,7 @@ describe("ExtensionRunner", () => {
 		it("reports the effective tier after a tool_call handler revises xd:// input", async () => {
 			const recordPath = path.join(tempDir.path(), "xdev-effective-tier.jsonl");
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
@@ -3912,6 +4363,7 @@ describe("ExtensionRunner", () => {
 		it("emits tool_call before the approval prompt so approval sees the final input", async () => {
 			const order: string[] = [];
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "prompt_tool") return;
@@ -3967,6 +4419,7 @@ describe("ExtensionRunner", () => {
 	describe("hasHandlers", () => {
 		it("returns true when handlers exist for event type", async () => {
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => undefined);
 				}
@@ -3993,6 +4446,7 @@ describe("ExtensionRunner", () => {
 			// streaming events (message_update / tool_execution_*) traverse the same
 			// path. `turn_start` stands in as a subscribed event with a trivial payload.
 			const extCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("turn_start", async () => {
 						throw new Error("turn_start handler ran");
@@ -4041,6 +4495,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4080,6 +4535,7 @@ describe("ExtensionRunner", () => {
 		it("isolates subscriber failures so other handlers still receive the event", async () => {
 			const eventsPath = path.join(tempDir.path(), "credential-disabled-isolated.jsonl");
 			const ext1Code = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async () => {
 						throw new Error("subscriber exploded");
@@ -4089,6 +4545,7 @@ describe("ExtensionRunner", () => {
 			const ext2Code = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4132,6 +4589,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("credential_disabled", async (event) => {
 						fs.appendFileSync(
@@ -4205,6 +4663,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("mcp_notification", async (event) => {
 						fs.appendFileSync(
@@ -4290,6 +4749,7 @@ describe("ExtensionRunner", () => {
 			const extCode = `
 				import * as fs from "node:fs";
 
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("mcp_notification", async (event) => {
 						fs.appendFileSync(
@@ -4603,6 +5063,7 @@ describe("ExtensionRunner", () => {
 	describe("context prompt caching", () => {
 		it("anchors Anthropic rolling breakpoints on persisted history behind injected messages", async () => {
 			const extensionCode = `
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					const name = import.meta.path.endsWith("inject-a.ts") ? "a" : "b";
 					pi.on("context", async event => ({

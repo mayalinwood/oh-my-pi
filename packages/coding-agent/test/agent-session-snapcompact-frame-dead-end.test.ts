@@ -100,6 +100,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 			fs.writeFileSync(
 				extensionPath,
 				[
+					"export const capabilities = [{ kind: 'events:subscribe' }];",
 					"export default function(pi) {",
 					'\tpi.on("session_before_compact", async (event) => {',
 					"\t\treturn {",

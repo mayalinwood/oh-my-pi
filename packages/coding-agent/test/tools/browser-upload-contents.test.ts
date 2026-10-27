@@ -548,7 +548,13 @@ return "done";`);
 			await prelude.invoke({ action: "close", name }, context);
 		}
 		// omp closed the page it launched, the last reader of the copies.
-		expect([...(await stagingFolders())].filter(folder => !before.has(folder))).toEqual([]);
+		// Only this process's copies: the harness runs chunks side by side, and `stagingFolders`
+		// lists every omp's folders in the shared temp directory.
+		expect(
+			[...(await stagingFolders())].filter(
+				folder => !before.has(folder) && folder.startsWith(`omp-uploads-${process.pid}-`),
+			),
+		).toEqual([]);
 	}, 60_000);
 });
 

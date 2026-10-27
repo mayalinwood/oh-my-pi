@@ -329,7 +329,75 @@ not an extension sandbox. Existing per-module load-failure handling is unchanged
 
 ### Runtime isolation model
 
-- Extensions are **not sandboxed** (same process/runtime).
+- Extensions are **not sandboxed** (same process/runtime). Capability grants
+  bound *what an extension may reach*, not what a granted reach can do once
+  inside the process.
+- An extension loaded from a path declares the host powers it needs, by
+  exporting `capabilities` alongside its factory:
+
+  ```ts
+  export const capabilities = [
+    { kind: 'tools:register' },
+    { kind: 'process:exec', command: 'git', args: ['rev-parse', '--show-toplevel'] },
+  ];
+  ```
+
+  The declaration defaults to empty, so an extension that declares nothing
+  reaches no privileged member. A kind the runtime does not implement fails
+  the load closed rather than being ignored.
+- `process:exec` is matched per invocation, not once at load: `*` matches
+  within one path segment and a trailing `**` absorbs the remaining arguments
+  for that command. A grant for `git rev-parse` does not authorise `git push`,
+  and a grant for `python3` does not authorise `bash`.
+- A refused call throws `ExtensionCapabilityDenied` naming the missing grant,
+  rather than leaving the member absent, so the failure names its cause at the
+  call site.
+- `loadExtensionFromFactory` is not gated: an inline factory is constructed by
+  the host, which already holds everything it passes on.
+- A path-loaded extension may also export a `manifest`, publishing what it
+  claims so a reviewer can read the claim **without executing the module**
+  (the Codex model):
+
+  ```ts
+  export const manifest = {
+    name: 'acme-change-guard',
+    version: '1.4.0',
+    description: 'Blocks force pushes on protected branches',
+    capabilities: [
+      { kind: 'tools:register' },
+      { kind: 'process:exec', command: 'git', args: ['rev-parse', '--show-toplevel'] },
+    ],
+  };
+  ```
+
+  The accepted shape is closed. `name` must be a string matching
+  `/^[a-z0-9][a-z0-9._-]*$/`; `version` must be a non-empty string that the
+  runtime never interprets; `description` is an optional string; and
+  `capabilities` is an optional mirror of the export above. A non-object, a
+  missing or malformed `name`/`version`, or any key outside that set is
+  refused.
+  - A malformed manifest raises `ExtensionManifestInvalid` and fails the load
+    closed, so a claim is never carried in a form a reader could misread:
+    `Extension "<path>" declares an invalid manifest: <detail>`. The manifest
+    is read at bind time, after the import, so this is a structured per-path
+    load error like any other rather than a throw out of module evaluation.
+  - An absent manifest is **not** an error. The extension simply has no review
+    identity, mirroring how absent `capabilities` means no grants — both
+    default closed.
+  - `name` is the review identity and must be **unique among the loaded set**. A
+    second extension claiming a name already taken is refused, so load order
+    cannot decide which module a reviewer believed they were reading.
+  - `manifest.capabilities` is a **mirror, never the authority**. `capabilities`
+    remains the single source of what an extension may reach; the mirror exists
+    only so one document carries the claim and the grant together. It is
+    compared **by reach, not by text**: reordering is tolerated, while a
+    different reach is refused with `manifest mirrors <...> but the module
+    declares <...>`. A `process:exec` mirror must name the same command and
+    args, not a wider pattern. A manifest can therefore neither under-report
+    nor over-report what the extension holds.
+  - Hooks and inline factories (`loadExtensionFromFactory`) are outside both
+    mechanisms, for the reason given above: the host already holds what they
+    reach.
 - They share one `EventBus` and one `ExtensionRuntime` instance.
 - During load, runtime action methods intentionally throw `ExtensionRuntimeNotInitializedError`; action wiring happens later in `ExtensionRunner.initialize()`.
 

@@ -14,6 +14,7 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -412,6 +413,392 @@ describe("AgentSession advisor toggle", () => {
 			vi.restoreAllMocks();
 			await raceSession.dispose();
 		}
+	});
+	it("exposes idempotent enable, no-replay context refresh, and stale-free disable transitions", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const historical: AgentMessage = { role: "user", content: "existing primary history", timestamp: 1 };
+		session.agent.replaceMessages([historical]);
+
+		const enabled = session.ensureAdvisor({
+			enabled: true,
+			reason: "deterministic high-risk review gate",
+			idempotencyKey: "enable-review",
+		});
+		expect(enabled).toMatchObject({
+			outcome: "enabled",
+			idempotent: false,
+			resetApplied: false,
+			enabled: true,
+			active: true,
+			advisors: ["default"],
+		});
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected Advisor runtime after public enable");
+		expect(advisor.state.messages).toEqual([]);
+
+		const duplicate = session.ensureAdvisor({
+			enabled: false,
+			reason: "a changed duplicate must not run",
+			idempotencyKey: "enable-review",
+		});
+		expect(duplicate).toMatchObject({
+			outcome: "enabled",
+			idempotent: true,
+			generation: enabled.generation,
+		});
+		expect(session.getAdvisorAgent()).toBe(advisor);
+
+		appendAdvisorCost(advisor, 0.5, 2);
+		advisor.state.messages.push({ role: "user", content: "stale private context", timestamp: 3 });
+		session.agent.steer({
+			role: "custom",
+			customType: "advisor",
+			content: "stale queued delivery",
+			display: true,
+			attribution: "agent",
+			timestamp: 4,
+		});
+		expect(session.queuedMessageCount).toBe(1);
+
+		const refreshed = session.ensureAdvisor({
+			enabled: true,
+			reason: "verified state changed",
+			idempotencyKey: "refresh-review",
+			resetMode: "context",
+		});
+		expect(refreshed).toMatchObject({ outcome: "unchanged", resetApplied: true, active: true });
+		expect(session.getAdvisorAgent()).toBe(advisor);
+		expect(advisor.state.messages).toEqual([]);
+		expect(session.agent.state.messages).toEqual([historical]);
+		expect(session.queuedMessageCount).toBe(0);
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: refreshed.generation,
+			enabled: true,
+			active: true,
+			tokens: 0,
+			cost: 0.5,
+			advisors: [
+				{
+					name: "default",
+					status: "running",
+					active: true,
+					model: { provider: model.provider, id: model.id },
+					configuredToolNames: ["read", "grep", "glob"],
+				},
+			],
+		});
+
+		const disabled = session.ensureAdvisor({
+			enabled: false,
+			reason: "review window complete",
+			idempotencyKey: "disable-review",
+		});
+		expect(disabled).toMatchObject({ outcome: "disabled", enabled: false, active: false });
+		const replayedEnable = session.ensureAdvisor({
+			enabled: true,
+			reason: "duplicate replay after later lifecycle change",
+			idempotencyKey: "enable-review",
+		});
+		expect(replayedEnable).toMatchObject({
+			outcome: "enabled",
+			idempotent: true,
+			generation: disabled.generation,
+			enabled: false,
+			active: false,
+		});
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+
+	it("rejects ambiguous automatic scope and reports unresolved models without changing the session", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "   ",
+				idempotencyKey: "missing-reason",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", enabled: false, active: false });
+
+		const ambiguous = session.ensureAdvisor({
+			enabled: true,
+			reason: "automatic review",
+			idempotencyKey: "ambiguous-review",
+		});
+		expect(ambiguous).toMatchObject({
+			outcome: "rejected",
+			enabled: false,
+			active: false,
+			advisors: ["Security", "Architecture"],
+		});
+
+		session.applyAdvisorConfigs([{ name: "Unavailable", model: "nonexistent/advisor-model" }], undefined);
+		const unavailable = session.ensureAdvisor({
+			enabled: true,
+			reason: "automatic review",
+			idempotencyKey: "unavailable-review",
+		});
+		expect(unavailable).toMatchObject({
+			outcome: "unavailable",
+			enabled: false,
+			active: false,
+			advisors: ["Unavailable"],
+		});
+	});
+
+	it("rejects scoped lifecycle changes that would replace active advisors outside the scope", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start the configured review roster",
+				idempotencyKey: "enable-roster",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+		const activeGeneration = session.getAdvisorStatus().generation;
+
+		expect(
+			session.ensureAdvisor({
+				enabled: false,
+				reason: "stop one review role",
+				idempotencyKey: "disable-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", generation: activeGeneration });
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: activeGeneration,
+			advisors: [
+				{ name: "Security", active: true },
+				{ name: "Architecture", active: true },
+			],
+		});
+
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		const architectureOnlyGeneration = session.getAdvisorStatus().generation;
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start a second review role",
+				idempotencyKey: "enable-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "rejected", generation: architectureOnlyGeneration });
+		expect(session.getAdvisorStatus()).toMatchObject({
+			generation: architectureOnlyGeneration,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: true },
+			],
+		});
+	});
+
+	it("disabling the sole active scoped Advisor does not resurrect configured entries", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start the review roster",
+				idempotencyKey: "enable-roster-for-scoped-disable",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+
+		session.applyAdvisorConfigs(
+			[{ name: "Security" }, { name: "Architecture", model: "missing/advisor-model" }],
+			undefined,
+		);
+		expect(session.getAdvisorStatus()).toMatchObject({
+			advisors: [
+				{ name: "Security", active: true },
+				{ name: "Architecture", active: false },
+			],
+		});
+
+		const disabled = session.ensureAdvisor({
+			enabled: false,
+			reason: "policy review complete",
+			idempotencyKey: "disable-sole-active-scoped-advisor",
+			advisor: "Security",
+		});
+		expect(disabled).toMatchObject({ outcome: "disabled", enabled: false, active: false });
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: false, active: false });
+	});
+
+	it("refreshes only active advisors and preserves disabled roster entries", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "start active review roles",
+				idempotencyKey: "start-active-roster",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+		session.applyAdvisorConfigs(
+			[{ name: "Security" }, { name: "Architecture" }, { name: "Audit", enabled: false }],
+			undefined,
+		);
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Architecture", active: true },
+			{ name: "Audit", active: false },
+		]);
+
+		const refreshed = session.ensureAdvisor({
+			enabled: true,
+			reason: "refresh active review roles",
+			idempotencyKey: "refresh-active-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(refreshed).toMatchObject({
+			outcome: "unchanged",
+			resetApplied: true,
+			advisors: ["Security", "Architecture"],
+		});
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Architecture", active: true },
+			{ name: "Audit", active: false },
+		]);
+	});
+
+	it("preserves disabled roster entries when activating from no live runtime", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security" }, { name: "Audit", enabled: false }], undefined);
+
+		const enabled = session.ensureAdvisor({
+			enabled: true,
+			reason: "start configured review roles",
+			idempotencyKey: "start-configured-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(enabled).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+		expect(session.getAdvisorStatus().advisors).toMatchObject([
+			{ name: "Security", active: true },
+			{ name: "Audit", active: false },
+		]);
+	});
+
+	it("rejects unnamed activation when every configured advisor is disabled", () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs(
+			[
+				{ name: "Security", enabled: false },
+				{ name: "Audit", enabled: false },
+			],
+			undefined,
+		);
+
+		const unavailable = session.ensureAdvisor({
+			enabled: true,
+			reason: "start configured review roles",
+			idempotencyKey: "start-empty-roster",
+			resetMode: "context",
+			allowMultiple: true,
+		});
+
+		expect(unavailable).toMatchObject({ outcome: "unavailable", active: false, advisors: [] });
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: false, active: false });
+	});
+
+	it("clears the lifecycle baseline when configs replace roster overrides", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const configs = [{ name: "Security", enabled: false }, { name: "Architecture" }];
+		session.applyAdvisorConfigs(configs, undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary security review",
+				idempotencyKey: "temporary-security-before-config",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", active: true });
+
+		session.applyAdvisorConfigs(configs, undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: false,
+				reason: "new lifecycle baseline after config",
+				idempotencyKey: "disable-after-config",
+				allowMultiple: true,
+			}),
+		).toMatchObject({ outcome: "disabled", active: false });
+		expect(await session.newSession()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({ enabled: true, active: true });
+	});
+
+	it("clears lifecycle roster overrides at a conversation boundary", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary security review",
+				idempotencyKey: "temporary-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+
+		expect(await session.newSession()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({
+			enabled: false,
+			active: false,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: false },
+			],
+		});
+	});
+
+	it("clears lifecycle roster overrides when forking a conversation", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.applyAdvisorConfigs([{ name: "Security", enabled: false }, { name: "Architecture" }], undefined);
+		expect(
+			session.ensureAdvisor({
+				enabled: true,
+				reason: "temporary fork review",
+				idempotencyKey: "temporary-fork-security",
+				advisor: "Security",
+			}),
+		).toMatchObject({ outcome: "enabled", advisors: ["Security"] });
+
+		expect(await session.fork()).toBe(true);
+
+		expect(session.getAdvisorStatus()).toMatchObject({
+			enabled: false,
+			active: false,
+			advisors: [
+				{ name: "Security", active: false },
+				{ name: "Architecture", active: false },
+			],
+		});
+	});
+
+	it("clears lifecycle request dedupe at a conversation reset", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const request = {
+			enabled: true,
+			reason: "review this conversation",
+			idempotencyKey: "conversation-review",
+		} as const;
+		expect(session.ensureAdvisor(request).idempotent).toBe(false);
+		expect(session.ensureAdvisor(request).idempotent).toBe(true);
+
+		expect(await session.newSession()).toBe(true);
+		const afterReset = session.ensureAdvisor(request);
+
+		expect(afterReset).toMatchObject({ outcome: "enabled", idempotent: false, active: true });
 	});
 
 	it("keeps sessions isolated when sharing a Settings instance", async () => {
@@ -1174,6 +1561,10 @@ describe("AgentSession advisor toggle", () => {
 			await advisorYielded.promise;
 			unsubscribe();
 
+			// The quota latch is a dispatch gate, not an advice gate: a note already
+			// admitted by the emission guard is still the primary's to receive. The
+			// release timing of a withheld note is covered by the delivery test
+			// below, so this case stays on quota classification alone.
 			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
 			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
 			adviseTool.beginUpdate(true);
@@ -1182,37 +1573,219 @@ describe("AgentSession advisor toggle", () => {
 				severity: "nit",
 			});
 			if (deferred.content.length === 0) throw new Error("Expected the advise tool to acknowledge the call");
-			// Behavior, not wording: a note deferred behind an in-progress turn
-			// holds only a reservation — it must stay out of the primary
-			// transcript until the terminal-boundary flush below releases it.
-			expect(
-				quotaSession.messages.some(message =>
-					JSON.stringify(message).includes("The final result still needs a regression test."),
-				),
-			).toBe(false);
+			expect(quotaSession.getAdvisorStatusOverview().advisors[0]?.yielded).toBe(true);
+		} finally {
+			await quotaSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
 
-			// The quota latch prevents another advisor dispatch. The tool boundary
-			// must keep the note out of the continuing model request; terminal
-			// completion may then release it into the primary transcript.
-			await quotaSession.prompt("Complete another primary turn");
-			await quotaSession.waitForIdle();
-			const continuingCall = mock.calls[2];
-			if (!continuingCall) throw new Error("Expected primary continuation call");
+	it("delivers a withheld note to the primary inside the run that produced it", async () => {
+		// The deferral exists so a partial-work critique cannot interrupt a primary
+		// mid-plan. Holding the withheld notes until the terminal boundary made a
+		// whole run's worth of them arrive as one burst describing steps already
+		// taken — and, under the terminal-answer policy, as a visible card no turn
+		// ever consumed. The continuing boundary is the first point where the
+		// primary is guaranteed to poll asides again, so the note must land there.
+		const note = "Concern: the checkpoint guard drops the signed trailer.";
+		const mock = createMockModel({
+			responses: [
+				{ content: ["primary opening"] },
+				{
+					content: [{ type: "toolCall", id: "continuing-turn", name: "missing-tool", arguments: {} }],
+					stopReason: "toolUse",
+				},
+				{ content: ["primary still working"] },
+			],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const liveSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(liveSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = liveSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			// Complete each advisor review deterministically; no provider call.
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await liveSession.prompt("start the work");
+			await liveSession.waitForIdle();
+
+			// Emitted while the next run is in progress: reserved, not delivered.
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-concern", { note, severity: "concern" });
+			expect(liveSession.messages.some(message => JSON.stringify(message).includes(note))).toBe(false);
+
+			// That run continues past a tool step, so its boundary must release the
+			// note into the run itself.
+			await liveSession.prompt("keep going");
+			await liveSession.waitForIdle();
+			const continuedCall = mock.calls[2];
+			if (!continuedCall) throw new Error("Expected the primary to make a third request");
+			expect(continuedCall.context.messages.some(message => JSON.stringify(message).includes(note))).toBe(true);
+		} finally {
+			await liveSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("keeps a withheld note through an extension context refresh and a lifecycle teardown", async () => {
+		// Both rebuild paths used to drop advice the primary had never received: the
+		// extension context refresh cleared the tool's deferred backlog, and tearing
+		// the runtime down unhooked the aside dispatcher, which rejected every
+		// queued entry. A note the emission guard already admitted is the primary's
+		// to see, so it must survive both — released into the run by the refresh,
+		// and still visible after a teardown.
+		const refreshed = "Concern: the refresh dropped the withheld note.";
+		const torn = "Concern: the teardown dropped the withheld note.";
+		const mock = createMockModel({
+			responses: [{ content: ["primary opening"] }, { content: ["primary done"] }],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const keepSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(keepSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = keepSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await keepSession.prompt("start the work");
+			await keepSession.waitForIdle();
+
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-across-refresh", { note: refreshed, severity: "concern" });
+			const result = keepSession.ensureAdvisor({
+				enabled: true,
+				reason: "context refresh for the withheld-note contract",
+				idempotencyKey: "withheld-note-refresh",
+				resetMode: "context",
+			});
+			expect(result.outcome).toBe("unchanged");
+
+			await keepSession.prompt("keep going");
+			await keepSession.waitForIdle();
+			const secondCall = mock.calls[1];
+			if (!secondCall) throw new Error("Expected a second primary request");
+			expect(secondCall.context.messages.some(message => JSON.stringify(message).includes(refreshed))).toBe(true);
+
+			// A teardown is the other loss path: the note has no turn left to ride
+			// into, so it must survive as visible advice rather than vanish with the
+			// runtime it belonged to.
+			const liveTool = keepSession.getAdvisorAgent()?.state.tools.find(tool => tool.name === "advise");
+			if (!(liveTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+			liveTool.beginUpdate(true);
+			await liveTool.execute("withheld-across-teardown", { note: torn, severity: "concern" });
+			expect(keepSession.setAdvisorEnabled(false)).toBe(false);
 			expect(
-				continuingCall.context.messages.some(message =>
-					JSON.stringify(message).includes("The final result still needs a regression test."),
-				),
-			).toBe(false);
+				keepSession.messages.some(message => message.role === "custom" && JSON.stringify(message).includes(torn)),
+			).toBe(true);
+		} finally {
+			await keepSession.dispose();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("routes advice a conversation re-prime destroys instead of dropping it with the backlog", async () => {
+		// The re-prime is the one reset path that collected nothing: it called
+		// resetDeliveredNotes() and the tool erased the backlog, so a note the
+		// emission guard had admitted AND acknowledged as queued simply stopped
+		// existing. It must come out the other side as visible advice — the same
+		// treatment the extension context refresh already gives it.
+		const note = "Concern: the /new re-prime ate the withheld note.";
+		const mock = createMockModel({
+			responses: [{ content: ["primary opening"] }, { content: ["primary done"] }],
+		});
+		const primaryAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const reprimeSession = new AgentSession({
+			agent: primaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+		});
+
+		try {
+			expect(reprimeSession.setAdvisorEnabled(true)).toBe(true);
+			const advisorAgent = reprimeSession.getAdvisorAgent();
+			if (!advisorAgent) throw new Error("Expected advisor agent to exist");
+			vi.spyOn(advisorAgent, "prompt").mockImplementation(async () => {
+				advisorAgent.state.messages.push(advisorMessage(0.1, 1));
+			});
+			const adviseTool = advisorAgent.state.tools.find(tool => tool.name === "advise");
+			if (!(adviseTool instanceof advisorModule.AdviseTool)) throw new Error("Expected advisor advise tool");
+
+			await reprimeSession.prompt("start the work");
+			await reprimeSession.waitForIdle();
+
+			adviseTool.beginUpdate(true);
+			await adviseTool.execute("withheld-across-reprime", { note, severity: "concern" });
+			expect(reprimeSession.messages.some(message => JSON.stringify(message).includes(note))).toBe(false);
+
+			// `/new`: the conversation boundary the backlog used to die on.
+			await reprimeSession.resetSessionContext();
+			await reprimeSession.waitForIdle();
+
 			expect(
-				quotaSession.messages.some(
-					message =>
-						message.role === "custom" &&
-						typeof message.content === "string" &&
-						message.content.includes("The final result still needs a regression test."),
+				reprimeSession.messages.some(
+					message => message.role === "custom" && JSON.stringify(message).includes(note),
 				),
 			).toBe(true);
 		} finally {
-			await quotaSession.dispose();
+			await reprimeSession.dispose();
 			vi.restoreAllMocks();
 		}
 	});

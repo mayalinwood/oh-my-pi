@@ -1231,7 +1231,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			settings,
 		);
 
-		const result = await loadExtensions(paths, cwd, eventBus);
+		const result = await loadExtensions(paths, cwd, eventBus, undefined, settings);
 		for (let i = 0; i < extensionFactories.length; i++) {
 			const loaded = await loadExtensionFromFactory(
 				extensionFactories[i],
@@ -1239,6 +1239,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				eventBus,
 				result.runtime,
 				`<inline-loader-${i}>`,
+				settings,
 			);
 			result.extensions.push(loaded);
 		}

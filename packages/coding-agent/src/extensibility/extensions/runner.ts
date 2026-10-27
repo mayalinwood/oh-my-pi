@@ -28,6 +28,7 @@ import {
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
+import type { AdvisorStatus, EnsureAdvisorRequest, EnsureAdvisorResult } from "../../advisor/control";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
@@ -84,6 +85,7 @@ import type {
 	McpNotificationEvent,
 	MessageRenderer,
 	RegisteredCommand,
+	RegisteredExtensionSettingsSection,
 	RegisteredTool,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
@@ -135,6 +137,31 @@ let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
+}
+
+function getUnavailableAdvisorStatus(): AdvisorStatus {
+	return {
+		generation: 0,
+		configured: false,
+		enabled: false,
+		active: false,
+		advisors: [],
+		tokens: 0,
+		cost: 0,
+	};
+}
+
+function ensureUnavailableAdvisor(request: EnsureAdvisorRequest): EnsureAdvisorResult {
+	return {
+		outcome: "unavailable",
+		reason: "This extension host does not support Advisor lifecycle actions",
+		generation: 0,
+		idempotent: false,
+		resetApplied: false,
+		enabled: false,
+		active: false,
+		advisors: request.advisor?.trim() ? [request.advisor.trim()] : [],
+	};
 }
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
@@ -818,6 +845,8 @@ export class ExtensionRunner {
 			await actions.setActiveTools(toolNames);
 		};
 		this.runtime.getCommands = actions.getCommands;
+		this.runtime.getAdvisorStatus = actions.getAdvisorStatus ?? getUnavailableAdvisorStatus;
+		this.runtime.ensureAdvisor = actions.ensureAdvisor ?? ensureUnavailableAdvisor;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
@@ -1182,6 +1211,25 @@ export class ExtensionRunner {
 			this.extensions.splice(0, this.extensions.length, ...active);
 		}
 		return { suspended, resumed };
+	}
+
+	/** Get native `/settings` sections in deterministic registration order. */
+	getSettingsSections(): RegisteredExtensionSettingsSection[] {
+		const sections = new Map<string, RegisteredExtensionSettingsSection>();
+		for (const extension of this.extensions) {
+			for (const section of extension.settingsSections?.values() ?? []) {
+				const existing = sections.get(section.id);
+				if (existing) {
+					logger.warn("Extension settings section conflict", {
+						sectionId: section.id,
+						extensionPath: section.extensionPath,
+						existingExtensionPath: existing.extensionPath,
+					});
+				}
+				sections.set(section.id, section);
+			}
+		}
+		return [...sections.values()];
 	}
 
 	/** Get all registered tools from all extensions. */

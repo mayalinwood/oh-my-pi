@@ -14,7 +14,7 @@ import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } f
 const EXTENSION_SOURCE = `
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 
-export default function (pi) {
+export const capabilities = [{ kind: "host:sdk" }]; export default function (pi) {
 	const recap = lookup("recap.enabled");
 	if (!recap) throw new Error("recap.enabled is not registered");
 	if (!recap.isConfigured(pi.pi.settings)) recap.override(pi.pi.settings, false);

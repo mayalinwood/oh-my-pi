@@ -32,6 +32,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { isLightTheme } from "@oh-my-pi/pi-tui/theme/theme";
+import type { ExtensionSettingProvenance } from "@oh-my-pi/pi-tui/overlays/extension-settings-types";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
@@ -175,6 +176,18 @@ export interface SettingsOptions {
 // Path Utilities
 // ═══════════════════════════════════════════════════════════════════════════
 
+const EXTENSION_SETTINGS_SECTION_ID_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
+const EXTENSION_SETTINGS_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
+function assertExtensionSettingsPath(sectionId: string, key?: string): void {
+	if (!EXTENSION_SETTINGS_SECTION_ID_PATTERN.test(sectionId)) {
+		throw new TypeError(`Invalid extension settings section id "${sectionId}"`);
+	}
+	if (key !== undefined && !EXTENSION_SETTINGS_KEY_PATTERN.test(key)) {
+		throw new TypeError(`Invalid extension setting key "${key}"`);
+	}
+}
+
 /**
  * Get a nested value from an object by path segments.
  */
@@ -278,6 +291,14 @@ function assertKnownSettingPaths(layer: RawSettings, prefix = ""): void {
 	for (const key in layer) {
 		const id = prefix ? `${prefix}.${key}` : key;
 		if (lookupSetting(id)) continue;
+		// Extension settings are host-owned but not registry-backed, so a layer may address the
+		// reserved namespace directly. Shape is checked by the extension settings id/key patterns.
+		if (id.startsWith("extensionSettings.")) {
+			const segments = id.split(".");
+			assertExtensionSettingsPath(segments[1], segments[2]);
+			if (segments.length > 3) throw new Error(`Unknown setting "${id}"`);
+			continue;
+		}
 		const value = layer[key];
 		if (!isRecord(value)) throw new Error(`Unknown setting "${id}"`);
 		assertKnownSettingPaths(value, id);
@@ -633,6 +654,8 @@ export class Settings {
 	#modified = new Map<string, readonly string[]>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
+	/** Individual extension settings modified in the native project configuration. */
+	#modifiedProjectExtensionSettings = new Map<string, Set<string>>();
 	/** Individual global model roles modified during this session (for partial save) */
 	#modifiedGlobalModelRoles = new Set<string>();
 	/** On-disk generations and prior values observed before each pending global mutation, keyed like {@link #modified}. */
@@ -874,6 +897,83 @@ export class Settings {
 	isConfigured(setting: AnySetting): boolean {
 		const value = getByPath(this.#mergedView(), setting.segments);
 		return value !== undefined && value !== null;
+	}
+
+	/**
+	 * Read one extension's effective raw settings object. The extension-owned
+	 * registration layer performs strict field validation and defaulting.
+	 */
+	getExtensionSettingsSection(sectionId: string): unknown {
+		assertExtensionSettingsPath(sectionId);
+		const value = getByPath(this.#merged, ["extensionSettings", sectionId]);
+		return value === undefined ? undefined : structuredClone(value);
+	}
+
+	/**
+	 * Layer supplying one extension setting's effective value, in the same precedence order as
+	 * {@link getProvenance}: runtime override → config overlay → project → global → schema default.
+	 * Extension settings are not registered {@link AnySetting} descriptors, so the layers are
+	 * consulted directly instead of through a settings descriptor.
+	 */
+	getExtensionSettingsProvenance(sectionId: string, key: string): ExtensionSettingProvenance {
+		assertExtensionSettingsPath(sectionId, key);
+		const segments = ["extensionSettings", sectionId, key];
+		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
+		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
+		if (getByPath(this.#project, segments) !== undefined) return "project";
+		if (getByPath(this.#global, segments) !== undefined) return "global";
+		return "default";
+	}
+
+	/**
+	 * Persist one validated extension setting in the native project config.
+	 * Extension startup snapshots intentionally remain detached from this layer.
+	 *
+	 * Fails closed when a runtime override or config overlay already supplies the value: an
+	 * on-disk project config must never silently shadow a decision made for the live session.
+	 */
+	setProjectExtensionSetting(sectionId: string, key: string, value: boolean | number | string): void {
+		assertExtensionSettingsPath(sectionId, key);
+		if (
+			(typeof value !== "boolean" && typeof value !== "number" && typeof value !== "string") ||
+			(typeof value === "number" && !Number.isFinite(value))
+		) {
+			throw new TypeError("Extension setting values must be booleans, finite numbers, or text");
+		}
+		const pinned = this.getExtensionSettingsProvenance(sectionId, key);
+		if (pinned === "runtime" || pinned === "overlay") {
+			throw new Error(
+				`Extension setting "${sectionId}.${key}" is supplied by the ${pinned} layer and cannot be overridden at project scope`,
+			);
+		}
+		setByPath(this.#project, ["extensionSettings", sectionId, key], value);
+		const modifiedKeys = this.#modifiedProjectExtensionSettings.get(sectionId) ?? new Set<string>();
+		modifiedKeys.add(key);
+		this.#modifiedProjectExtensionSettings.set(sectionId, modifiedKeys);
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#queueProjectSave();
+	}
+
+	/**
+	 * Clear the project-layer value of one extension setting so the next launch falls back to the
+	 * next layer that supplies it, or to the extension's declared default. Fails closed for the
+	 * same reason as {@link setProjectExtensionSetting}.
+	 */
+	resetExtensionSetting(sectionId: string, key: string): void {
+		assertExtensionSettingsPath(sectionId, key);
+		const pinned = this.getExtensionSettingsProvenance(sectionId, key);
+		if (pinned === "runtime" || pinned === "overlay") {
+			throw new Error(
+				`Extension setting "${sectionId}.${key}" is supplied by the ${pinned} layer and cannot be reset at project scope`,
+			);
+		}
+		if (getByPath(this.#project, ["extensionSettings", sectionId, key]) === undefined) return;
+		deleteByPath(this.#project, ["extensionSettings", sectionId, key]);
+		this.#modifiedProjectExtensionSettings.get(sectionId)?.delete(key);
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#queueProjectSave();
 	}
 
 	/**
@@ -1272,7 +1372,7 @@ export class Settings {
 		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
 			await this.#chainSave();
 		}
-		if (this.#modifiedProjectModelRoles.size > 0) {
+		if (this.#modifiedProjectModelRoles.size > 0 || this.#modifiedProjectExtensionSettings.size > 0) {
 			await this.#saveProjectNow();
 		}
 	}
@@ -3837,11 +3937,20 @@ export class Settings {
 	}
 
 	async #saveProjectNow(): Promise<void> {
-		if (this.#savesCancelled || !this.#persist || this.#modifiedProjectModelRoles.size === 0) return;
+		if (
+			this.#savesCancelled ||
+			!this.#persist ||
+			(this.#modifiedProjectModelRoles.size === 0 && this.#modifiedProjectExtensionSettings.size === 0)
+		)
+			return;
 
 		const projectConfigPath = path.join(getProjectAgentDir(this.#cwd), "config.yml");
 		const modifiedModelRoles = [...this.#modifiedProjectModelRoles];
+		const modifiedExtensionSettings = [...this.#modifiedProjectExtensionSettings].map(
+			([sectionId, keys]) => [sectionId, [...keys]] as const,
+		);
 		this.#modifiedProjectModelRoles.clear();
+		this.#modifiedProjectExtensionSettings.clear();
 
 		try {
 			await fs.promises.mkdir(path.dirname(projectConfigPath), { recursive: true });
@@ -3856,6 +3965,13 @@ export class Settings {
 					const value = isRecord(projectRoles) ? projectRoles[role] : undefined;
 					setByPath(projectSettings, ["modelRoles", role], value);
 				}
+				for (const [sectionId, keys] of modifiedExtensionSettings) {
+					const section = getByPath(this.#project, ["extensionSettings", sectionId]);
+					for (const key of keys) {
+						const value = isRecord(section) ? section[key] : undefined;
+						setByPath(projectSettings, ["extensionSettings", sectionId, key], value);
+					}
+				}
 
 				await this.#writeYamlAtomically(writePath, stringifyYamlConfig(projectSettings));
 				this.#projectFileSettings = structuredClone(projectSettings);
@@ -3865,6 +3981,11 @@ export class Settings {
 		} catch (error) {
 			for (const role of modifiedModelRoles) {
 				this.#modifiedProjectModelRoles.add(role);
+			}
+			for (const [sectionId, keys] of modifiedExtensionSettings) {
+				const pendingKeys = this.#modifiedProjectExtensionSettings.get(sectionId) ?? new Set<string>();
+				for (const key of keys) pendingKeys.add(key);
+				this.#modifiedProjectExtensionSettings.set(sectionId, pendingKeys);
 			}
 			throw error;
 		}

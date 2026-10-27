@@ -7,6 +7,8 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import ms from "ms";
 
+export const capabilities = [{ kind: "tools:register" }];
+
 export default function (pi: ExtensionAPI) {
 	const z = pi.zod;
 

@@ -17,6 +17,9 @@ import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	ADVISOR_DEFERRED_RELEASE_LIMIT,
+	ADVISOR_MAX_BUDGET_PER_UPDATE,
+	ADVISOR_MAX_DEFERRED_NOTES,
 	AdviseTool,
 	type AdvisorAgent,
 	AdvisorEmissionGuard,
@@ -683,6 +686,31 @@ describe("advisor", () => {
 			expect(yq.has("advisor")).toBe(false);
 			expect(yq.has("normal")).toBe(true);
 		});
+
+		it("take(kind) hands queued entries to the caller instead of dropping them", () => {
+			// An advisor runtime rebuild must not silently swallow advice the primary
+			// never received: the entries leave the queue in the caller's hands, and
+			// only that kind's entries move.
+			const yq = new YieldQueue({
+				isStreaming: () => false,
+				injectIdle: async () => {},
+				scheduleIdleFlush: () => {},
+			});
+			yq.register<{ note: string }>("advisor", {
+				build: entries => (entries.length === 0 ? null : ({ role: "custom", content: "x" } as AgentMessage)),
+				skipIdleFlush: true,
+			});
+			yq.register<{ note: string }>("other", {
+				build: entries => (entries.length === 0 ? null : ({ role: "custom", content: "y" } as AgentMessage)),
+			});
+
+			yq.enqueue("advisor", { note: "released but not yet injected" });
+			yq.enqueue("other", { note: "unrelated" });
+
+			expect(yq.take("advisor")).toEqual([{ note: "released but not yet injected" }]);
+			expect(yq.has("advisor")).toBe(false);
+			expect(yq.has("other")).toBe(true);
+		});
 	});
 
 	describe("AdviseTool", () => {
@@ -695,7 +723,7 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "nit", undefined);
+			expect(onAdvice).toHaveBeenCalledWith(note, "nit");
 		});
 
 		it("allows the same advice after delivered-note memory resets", async () => {
@@ -708,8 +736,8 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(2);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit");
 		});
 
 		it("forwards escalations of an already-delivered note and suppresses downgrades", async () => {
@@ -725,9 +753,9 @@ describe("advisor", () => {
 			await tool.execute("tc-5", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
+			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker");
 		});
 
 		it("routes a same-text blocker escalation of an already-delivered note with the production guard", async () => {
@@ -772,7 +800,7 @@ describe("advisor", () => {
 
 			// Deferred notes are NOT delivered mid-turn; blocker still goes through.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker", undefined);
+			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker");
 			// The tool tells the advisor the note is deferred, not silently "Recorded.".
 			expect(JSON.stringify(deferred.content)).toContain("Queued for the end of the turn");
 
@@ -784,8 +812,8 @@ describe("advisor", () => {
 			// oldest first — no reliance on the advisor model re-raising them.
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
-			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
+			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit");
 
 			// A later explicit re-raise of the same note is deduped (already delivered).
 			await tool.execute("tc-4", { note, severity: "concern" });
@@ -805,7 +833,7 @@ describe("advisor", () => {
 			tool.beginUpdate(false);
 			// Identical note queued once, flushed once.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "concern", undefined);
+			expect(onAdvice).toHaveBeenCalledWith(note, "concern");
 		});
 
 		it("retains the highest severity when duplicate deferred advice escalates", async () => {
@@ -818,7 +846,7 @@ describe("advisor", () => {
 
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern", undefined);
+			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern");
 		});
 
 		it("flushes one deferred concern per update past the per-update emission budget on a late catch-up", async () => {
@@ -1110,6 +1138,99 @@ describe("advisor", () => {
 			]);
 		});
 
+		it("releases a withheld note at a continuing boundary as non-interrupting advice", async () => {
+			// A note withheld behind an in-progress turn describes work the primary
+			// has not finished. Releasing it only at the terminal boundary let a whole
+			// run's worth of notes accumulate and arrive as one burst about steps
+			// already taken. The continuing boundary is the first point where the
+			// primary is guaranteed to poll asides again, so the note is handed over
+			// there — and handed over tagged, because escalating to a steer there
+			// would hijack the very run the withholding protected.
+			const delivered: {
+				note: string;
+				severity?: string;
+				delivery?: { withheldInLiveRun?: boolean };
+			}[] = [];
+			const tool = new AdviseTool((note, severity, delivery) => delivered.push({ note, severity, delivery }));
+			const note = "Concern: the checkpoint guard drops the signed trailer.";
+
+			tool.beginUpdate(true);
+			await tool.execute("w-0", { note, severity: "concern" });
+			expect(delivered).toEqual([]);
+
+			tool.flushDeferredNotes("continuation");
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]?.note).toBe(note);
+			expect(delivered[0]?.severity).toBe("concern");
+			expect(delivered[0]?.delivery).toEqual({ withheldInLiveRun: true });
+
+			// A terminal release carries no continuation: the run is over and there
+			// is no further boundary to consume an aside, so the terminal policy owns
+			// the note (visible card) instead of parking it in the aside queue.
+			tool.beginUpdate(true);
+			await tool.execute("w-1", { note: "Nit: rename the helper.", severity: "nit" });
+			tool.flushDeferredNotes();
+			expect(delivered).toHaveLength(2);
+			expect(delivered[1]?.note).toBe("Nit: rename the helper.");
+			expect(delivered[1]?.delivery).toBeUndefined();
+		});
+
+		it("stamps live notes with the covered turn, and keeps the plain signature when none is given", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+
+			tool.beginUpdate(false, 4);
+			await tool.execute("s-0", { note: "Stamped live note.", severity: "concern" });
+			expect(onAdvice).toHaveBeenLastCalledWith("Stamped live note.", "concern", { turn: 4 });
+
+			// An update that reviewed no known turn must not invent one.
+			tool.beginUpdate(false);
+			await tool.execute("s-1", { note: "Unstamped live note.", severity: "concern" });
+			expect(onAdvice).toHaveBeenLastCalledWith("Unstamped live note.", "concern");
+		});
+
+		it("keeps a withheld note's own covered turn through a later update and both release points", async () => {
+			const delivered: { note: string; delivery?: { withheldInLiveRun?: boolean; turn?: number } }[] = [];
+			const tool = new AdviseTool((note, _severity, delivery) => delivered.push({ note, delivery }));
+
+			// The review of turn 2 withheld this note; a later update (turn 5) must
+			// not restamp it as its own.
+			tool.beginUpdate(true, 2);
+			await tool.execute("k-0", { note: "Concern raised while reviewing turn 2.", severity: "concern" });
+			tool.beginUpdate(true, 5);
+			tool.flushDeferredNotes("continuation");
+			expect(delivered).toEqual([
+				{ note: "Concern raised while reviewing turn 2.", delivery: { withheldInLiveRun: true, turn: 2 } },
+			]);
+
+			tool.beginUpdate(true, 6);
+			await tool.execute("k-1", { note: "Nit raised while reviewing turn 6.", severity: "nit" });
+			tool.flushDeferredNotes();
+			expect(delivered[1]).toEqual({ note: "Nit raised while reviewing turn 6.", delivery: { turn: 6 } });
+
+			// The completed-update transition releases with the stamp too.
+			tool.beginUpdate(true, 7);
+			await tool.execute("k-2", { note: "Concern raised while reviewing turn 7.", severity: "concern" });
+			tool.beginUpdate(false, 8);
+			expect(delivered[2]).toEqual({ note: "Concern raised while reviewing turn 7.", delivery: { turn: 7 } });
+		});
+
+		it("does not stamp the single summary a deep backlog collapses into", async () => {
+			const delivered: { note: string; delivery?: { turn?: number } }[] = [];
+			const tool = new AdviseTool((note, _severity, delivery) => delivered.push({ note, delivery }));
+			for (let update = 1; update <= ADVISOR_DEFERRED_RELEASE_LIMIT + 1; update++) {
+				tool.beginUpdate(true, update);
+				await tool.execute(`c-${update}`, { note: `Distinct concern number ${update}.`, severity: "concern" });
+			}
+			tool.flushDeferredNotes();
+
+			// One more withheld note than a readable release carries: they leave as
+			// ONE summary, which has no single age to report.
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]?.note).toContain(`${ADVISOR_DEFERRED_RELEASE_LIMIT + 1} advisor notes were withheld`);
+			expect(delivered[0]?.delivery).toBeUndefined();
+		});
+
 		it("resetDeliveredNotes resets the guard and the pending backlog together", async () => {
 			const delivered: string[] = [];
 			const tool = new AdviseTool(note => delivered.push(note), new AdvisorEmissionGuard({ budgetPerUpdate: 1 }));
@@ -1125,6 +1246,193 @@ describe("advisor", () => {
 			// The guard's dedupe memory is gone too: the same note admits again.
 			await tool.execute("q-1", { note: "Queued but never flushed.", severity: "concern" });
 			expect(delivered).toEqual(["Queued but never flushed."]);
+		});
+
+		it("bounds the withheld backlog and collapses an overflow into one card naming the drop", async () => {
+			// The backlog was the one unbounded store in the advisor delivery path:
+			// it grows by one admitted note per in-progress update, is drained only
+			// at a turn boundary, and one reset used to erase it without a word. Four
+			// maximal updates (128 admitted notes) run far past
+			// ADVISOR_MAX_DEFERRED_NOTES, and a single flush must still release ONE
+			// card — the burst this bound exists to prevent is the failure mode, not
+			// an acceptable outcome.
+			const delivered: { note: string; severity?: string }[] = [];
+			const tool = new AdviseTool(
+				(note, severity) => delivered.push({ note, severity }),
+				new AdvisorEmissionGuard({ budgetPerUpdate: ADVISOR_MAX_BUDGET_PER_UPDATE }),
+			);
+
+			for (let update = 0; update < 4; update++) {
+				tool.beginUpdate(true);
+				for (let n = 0; n < ADVISOR_MAX_BUDGET_PER_UPDATE; n++) {
+					await tool.execute(`o-${update}-${n}`, { note: `Update ${update} note ${n}.`, severity: "nit" });
+				}
+			}
+			// Nothing escapes mid-run: the bound does not become a burst trigger.
+			expect(delivered).toEqual([]);
+
+			const loss = tool.flushDeferredNotes();
+
+			// ONE card, whatever the backlog reached.
+			expect(delivered).toHaveLength(1);
+			const card = delivered[0]!;
+			const admitted = 4 * ADVISOR_MAX_BUDGET_PER_UPDATE;
+			expect(card.note).toContain(`${admitted} advisor notes were withheld behind this turn`);
+			// The bound is what the coalesced card cannot show: the card's arithmetic
+			// is identical whether the bound ran or not, because oldest-first
+			// eviction never touches the survivors it quotes. The high-water mark is
+			// the only thing that changes, and it fails outright without the bound.
+			expect(admitted).toBeGreaterThan(ADVISOR_MAX_DEFERRED_NOTES);
+			expect(loss.peak).toBe(ADVISOR_MAX_DEFERRED_NOTES);
+			expect(loss.peak).toBeLessThanOrEqual(ADVISOR_MAX_DEFERRED_NOTES);
+			// The count is arithmetic, not decoration: every admitted note is either
+			// quoted or named as dropped.
+			expect(card.note).toContain(`${admitted - 2} of them were dropped`);
+			// The most severe survive by content, equal ranks by recency: a note that
+			// has sat longest behind a mid-turn run describes the work least like what
+			// the primary is doing now.
+			expect(card.note).toContain("- Update 3 note 30.");
+			expect(card.note).toContain("- Update 3 note 31.");
+			expect(card.note).not.toContain("Update 0 note 0.");
+			// The backlog never exceeded the bound: the 128 admissions could only be
+			// carried as the bound plus the reported drops.
+			expect(admitted).toBeGreaterThan(ADVISOR_MAX_DEFERRED_NOTES);
+		});
+
+		it("keeps the backlog's most severe note when an overflow arrives at a full backlog", async () => {
+			// Eviction must not be a severity inversion. A backlog of nits must not be
+			// able to freeze a single queued concern in place by staying full, and a
+			// concern arriving into a full backlog takes a nit rather than the concern
+			// already sitting there.
+			const delivered: { note: string; severity?: string }[] = [];
+			const tool = new AdviseTool(
+				(note, severity) => delivered.push({ note, severity }),
+				new AdvisorEmissionGuard({ budgetPerUpdate: ADVISOR_MAX_DEFERRED_NOTES }),
+			);
+
+			// Fill the backlog to the bound with nits, then push a concern past it.
+			for (let n = 0; n < ADVISOR_MAX_DEFERRED_NOTES; n++) {
+				tool.beginUpdate(true);
+				await tool.execute(`n-${n}`, { note: `Nit ${n}.`, severity: "nit" });
+			}
+			tool.beginUpdate(true);
+			await tool.execute("c-0", { note: "Concern: the bound is full.", severity: "concern" });
+
+			// The concern entered against a FULL backlog: it took the bound's slot,
+			// so the backlog reached the bound and no further. Without the bound this
+			// would be bound+1 and the eviction never happened.
+			const loss = tool.flushDeferredNotes();
+			expect(loss.peak).toBe(ADVISOR_MAX_DEFERRED_NOTES);
+			expect(delivered).toHaveLength(1);
+			// The summary carries the backlog's real weight, so a buried concern
+			// still gets the concern channel rather than being flattened to a nit.
+			expect(delivered[0]!.severity).toBe("concern");
+			expect(delivered[0]!.note).toContain("- Concern: the bound is full.");
+			// The oldest nit made way for it; a strictly lower-ranked victim is
+			// preferred over the concern already queued.
+			expect(delivered[0]!.note).not.toContain("- Nit 0.");
+		});
+
+		it("releases at most one readable turn of notes from a single boundary flush", async () => {
+			// The coalescing is not "collapse everything": a backlog that still fits
+			// the readable ceiling arrives note by note, which is the behaviour issue
+			// #10271 depends on. The ceiling is a constant, so the worst-case single
+			// release is a fixed number rather than a function of how long the run went
+			// on or how the per-update budget happens to be configured.
+			const atCeiling: string[] = [];
+			const atCeilingTool = new AdviseTool(note => atCeiling.push(note), new AdvisorEmissionGuard());
+			// One note per update, so every admission clears the per-update budget and
+			// only the readable ceiling can stop the backlog.
+			for (let n = 0; n < ADVISOR_DEFERRED_RELEASE_LIMIT; n++) {
+				atCeilingTool.beginUpdate(true);
+				await atCeilingTool.execute(`b-${n}`, { note: `Concern ${n}.`, severity: "concern" });
+			}
+			const atCeilingLoss = atCeilingTool.flushDeferredNotes();
+			expect(atCeilingLoss.peak).toBe(ADVISOR_DEFERRED_RELEASE_LIMIT);
+			// The ceiling is a real boundary, not a vacuous one: exactly that many
+			// cards, each a real note.
+			expect(atCeiling).toHaveLength(ADVISOR_DEFERRED_RELEASE_LIMIT);
+			expect(atCeiling[0]).toBe("Concern 0.");
+			expect(atCeiling.at(-1)).toBe(`Concern ${ADVISOR_DEFERRED_RELEASE_LIMIT - 1}.`);
+
+			// One past the ceiling collapses, and the collapse is one card.
+			const pastCeiling: string[] = [];
+			const pastCeilingTool = new AdviseTool(note => pastCeiling.push(note), new AdvisorEmissionGuard());
+			for (let n = 0; n <= ADVISOR_DEFERRED_RELEASE_LIMIT; n++) {
+				pastCeilingTool.beginUpdate(true);
+				await pastCeilingTool.execute(`c-${n}`, { note: `Concern ${n}.`, severity: "concern" });
+			}
+			pastCeilingTool.flushDeferredNotes();
+			expect(pastCeiling).toHaveLength(1);
+			expect(pastCeiling[0]).not.toContain("Concern 0.");
+			expect(pastCeiling[0]).toContain(
+				`${ADVISOR_DEFERRED_RELEASE_LIMIT + 1} advisor notes were withheld behind this turn.`,
+			);
+		});
+
+		it("reports the backlog a reset destroys instead of discarding it silently", async () => {
+			// resetDeliveredNotes is the path that actually loses things: the
+			// conversation re-prime ran it with no collection at all. It now returns
+			// what it removed, so no caller can destroy the backlog without the
+			// amount being knowable — and it routes nothing itself, leaving delivery
+			// to the caller that owns the delivery state.
+			const delivered: string[] = [];
+			const tool = new AdviseTool(note => delivered.push(note), new AdvisorEmissionGuard({ budgetPerUpdate: 2 }));
+
+			tool.beginUpdate(true);
+			await tool.execute("r-0", { note: "Concern: the reset eats it.", severity: "concern" });
+			await tool.execute("r-1", { note: "Nit: also queued.", severity: "nit" });
+			const overBudget = await tool.execute("r-2", { note: "Nit: over budget.", severity: "nit" });
+			// The guard, not the backlog, is what refused this one.
+			expect(JSON.stringify(overBudget.content)).toContain("budget");
+
+			const loss = tool.resetDeliveredNotes();
+			expect(loss.notes.map(item => item.note)).toEqual(["Concern: the reset eats it.", "Nit: also queued."]);
+			expect(loss.dropped).toBe(0);
+			// A backlog that never reached the bound reports the size it actually
+			// was, so "no bound drops" is distinguishable from "no backlog".
+			expect(loss.peak).toBe(2);
+			expect(delivered).toEqual([]);
+
+			// And the backlog really is gone: a later boundary cannot replay it.
+			tool.flushDeferredNotes();
+			expect(delivered).toEqual([]);
+		});
+
+		it("carries the bound's drop count through a reset that destroys the backlog", async () => {
+			// Bounding the buffer is not enough if the reset can still eat the
+			// evidence: the count the bound produced has to survive the destruction
+			// that the count exists to report.
+			const tool = new AdviseTool(() => {}, new AdvisorEmissionGuard({ budgetPerUpdate: 2 }));
+			// One note per update, so every admission is a fresh guard slot and the
+			// backlog — not the per-update budget — is the only thing that can bound it.
+			const admitted = ADVISOR_MAX_DEFERRED_NOTES + 8;
+			for (let update = 0; update < admitted; update++) {
+				tool.beginUpdate(true);
+				await tool.execute(`s-${update}`, { note: `Nit ${update}.`, severity: "nit" });
+			}
+
+			const loss = tool.resetDeliveredNotes();
+			// The bound engaged: the admissions outran the backlog by construction,
+			// and the backlog never once exceeded the bound while they did.
+			expect(admitted).toBeGreaterThan(ADVISOR_MAX_DEFERRED_NOTES);
+			expect(loss.peak).toBe(ADVISOR_MAX_DEFERRED_NOTES);
+			// Every admitted note is either quoted or named as dropped — the count is
+			// arithmetic over the whole backlog, not the bound's surplus alone, and it
+			// survived the reset that destroyed the notes.
+			expect(loss.dropped).toBe(admitted - 2);
+			expect(loss.notes).toHaveLength(1);
+			const card = loss.notes[0]!.note;
+			expect(card).toContain(`${admitted} advisor notes were withheld behind this turn.`);
+			expect(card).toContain(`${admitted - 2} of them were dropped`);
+			// The bound evicted oldest-first, so the survivors — and therefore the
+			// quoted content — are the most recent notes, not the ones that had been
+			// sitting behind the run longest.
+			expect(card).toContain(`- Nit ${admitted - 1}.`);
+			expect(card).toContain(`- Nit ${admitted - 2}.`);
+			expect(card).not.toContain("- Nit 0.");
+			// A loss report is informational: it must not wake the primary.
+			expect(loss.notes[0]!.severity).toBeUndefined();
 		});
 
 		it("validates parameters using ArkType", () => {
@@ -3991,6 +4299,46 @@ describe("advisor", () => {
 			expect(promptText(promptInputs[2])).not.toContain("ancient-primary-one");
 			expect(promptText(promptInputs[2])).not.toContain("ancient-primary-two");
 			expect(resetCount).toBe(1);
+		});
+
+		it("refreshes private context at the current cursor without replaying primary history", async () => {
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let resetCount = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+				},
+				abort: () => {},
+				reset: () => {
+					resetCount++;
+					state.messages.length = 0;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "ancient-primary", timestamp: 1 } as AgentMessage,
+				{ role: "user", content: "current-before-refresh", timestamp: 2 } as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+			});
+			runtime.seedTo(messages.length);
+
+			messages.push({ role: "user", content: "reviewed-before-refresh", timestamp: 3 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 1 && runtime.backlog === 0);
+
+			runtime.refreshContext(messages.length, "extension-context-refresh");
+			messages.push({ role: "user", content: "only-after-refresh", timestamp: 4 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 2 && runtime.backlog === 0);
+
+			expect(resetCount).toBe(1);
+			expect(promptText(promptInputs[1])).toContain("only-after-refresh");
+			expect(promptText(promptInputs[1])).not.toContain("ancient-primary");
+			expect(promptText(promptInputs[1])).not.toContain("current-before-refresh");
+			expect(promptText(promptInputs[1])).not.toContain("reviewed-before-refresh");
 		});
 
 		it("re-renders a queued primary context before its maintenance budget after overflow resets advisor context", async () => {
@@ -6945,6 +7293,50 @@ describe("advisor", () => {
 				).toBe(channel);
 			},
 		);
+
+		it("keeps a note released inside a continuing run on the non-interrupting aside channel", () => {
+			// The withholding decision and the release point are different policies.
+			// A note released at a boundary where the primary is about to make
+			// another request must not re-escalate into the interrupting channel the
+			// withholding declined to use — that would hijack the run the deferral
+			// protected — and must not be preserved either, because the run is still
+			// going. A blocker is exempt: it never gets withheld, so it keeps the
+			// authority to interrupt.
+			for (const severity of ["nit", "concern", undefined] as const) {
+				expect(
+					resolveAdvisorDeliveryChannel({
+						severity,
+						continueSeverity: "nit",
+						autoResumeSuppressed: false,
+						streaming: false,
+						aborting: false,
+						withheldInLiveRun: true,
+					}),
+				).toBe("aside");
+			}
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "blocker",
+					continueSeverity: "nit",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					withheldInLiveRun: true,
+				}),
+			).toBe("steer");
+			// A headless drain that forbids primary turns still owns its notes.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					continueSeverity: "nit",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					preserveOnly: true,
+					withheldInLiveRun: true,
+				}),
+			).toBe("preserve");
+		});
 
 		it("preserves a terminal continuation blocked by stop suppression, preserveOnly, or the cooldown", () => {
 			const terminal = {

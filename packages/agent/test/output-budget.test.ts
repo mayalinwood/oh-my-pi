@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AssistantMessage, Context, Message, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Message, Model, Tool } from "@oh-my-pi/pi-ai";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -86,6 +86,42 @@ describe("fitOutputTokensToContextWindow", () => {
 		};
 		const cap = fitOutputTokensToContextWindow(deepseek, context, undefined, tokenizer) ?? 0;
 		expect(cap).toBeLessThanOrEqual(1_000_000 - 700_000);
+	});
+	test("counts only normalized system prompt fragments when runtime hooks return invalid values", () => {
+		const fragments = Array.from({ length: 16 }, (_, index) => `system ${index}`) as unknown[];
+		fragments[7] = undefined;
+		const context: Context = {
+			systemPrompt: fragments as string[],
+			messages: promptOf(2_000).messages,
+		};
+		const normalizedContext: Context = {
+			...context,
+			systemPrompt: fragments.filter((fragment): fragment is string => typeof fragment === "string"),
+		};
+		const model = { ...deepseek, contextWindow: 8_000 };
+		const cap = fitOutputTokensToContextWindow(model, context, undefined, tokenizer);
+
+		expect(cap).toBeGreaterThan(0);
+		expect(cap).toBe(fitOutputTokensToContextWindow(model, normalizedContext, undefined, tokenizer));
+	});
+	test("counts only string-valued active and retired tool metadata in cold contexts", () => {
+		const invalidActiveTool = { name: undefined, description: "active", parameters: {} } as unknown as Tool;
+		const invalidInactiveTool = { name: "retired", description: undefined, parameters: {} } as unknown as Tool;
+		const context: Context = {
+			...promptOf(500),
+			tools: [invalidActiveTool],
+			inactiveTools: [invalidInactiveTool],
+		};
+		const normalizedContext: Context = {
+			...promptOf(500),
+			tools: [{ name: "", description: "active", parameters: {} as never }],
+			inactiveTools: [{ name: "retired", description: "", parameters: {} as never }],
+		};
+		const model = { ...deepseek, contextWindow: 1_800, maxTokens: 1_500 };
+		const cap = fitOutputTokensToContextWindow(model, context, undefined, tokenizer);
+
+		expect(cap).toBeLessThan(1_500);
+		expect(cap).toBe(fitOutputTokensToContextWindow(model, normalizedContext, undefined, tokenizer));
 	});
 
 	test("keeps an OpenRouter default cap omitted, but still fits an explicit one", () => {

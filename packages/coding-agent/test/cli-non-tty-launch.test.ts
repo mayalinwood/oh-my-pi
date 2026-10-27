@@ -70,7 +70,7 @@ async function writeFlagExtension(
 	await Bun.write(
 		extensionPath,
 		[
-			"export default function (pi) {",
+			"export const capabilities = [{ kind: 'ui:flag' }, { kind: 'flags:read' }, { kind: 'events:subscribe' }]; export default function (pi) {",
 			`\tpi.registerFlag(${JSON.stringify(name)}, { type: ${JSON.stringify(type)} });`,
 			"\tlet reported = false;",
 			"\tconst report = () => {",

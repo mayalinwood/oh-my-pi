@@ -32,6 +32,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 const HANG_EXTENSION_SRC = `
+	export const capabilities = [{ kind: 'events:subscribe' }];
 	export default function(pi) {
 		pi.on("session_shutdown", async () => {
 			await Promise.withResolvers().promise;

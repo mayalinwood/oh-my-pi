@@ -301,6 +301,12 @@ export interface AdvisorNote {
 	turn?: number;
 	/** Primary turns elapsed before merged-batch delivery. */
 	turnsAgo?: number;
+	/**
+	 * The model that actually produced this note, as `provider/id`, captured at
+	 * emission time. Display-only and deliberately not part of the agent-facing
+	 * `<advisory>` bytes, so it never reaches the primary's context.
+	 */
+	advisorModel?: string;
 }
 
 /** Details payload on the batched `advisor` custom message rendered in the transcript. */

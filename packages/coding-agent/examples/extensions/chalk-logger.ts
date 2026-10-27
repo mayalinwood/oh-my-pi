@@ -5,6 +5,8 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 
+export const capabilities = [{ kind: "events:subscribe" }];
+
 export default function (pi: ExtensionAPI) {
 	// Log with colors using chalk
 	console.log(`${chalk.green("✓")} ${chalk.bold("chalk-logger extension loaded")}`);

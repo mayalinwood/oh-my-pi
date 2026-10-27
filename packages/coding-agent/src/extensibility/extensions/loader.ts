@@ -18,9 +18,11 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { isBuiltinComposerStyle, type KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import type { AdvisorStatus, EnsureAdvisorRequest, EnsureAdvisorResult } from "../../advisor/control";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
+import { findScopedSettings, Settings } from "../../config/settings";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -39,12 +41,16 @@ import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+import { registerExtensionSettingsSection } from "./settings-section";
 import type {
 	AssistantThinkingRenderer,
 	Extension,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
+	ExtensionSettingField,
+	ExtensionSettingsSectionDefinition,
+	ExtensionSettingsSnapshot,
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
@@ -55,11 +61,49 @@ import type {
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
+import {
+	applyCapabilityGate,
+	EXTENSION_MEMBER_CAPABILITIES,
+	fullExtensionGrants,
+	resolveExtensionGrants,
+	type ResolvedExtensionGrants,
+} from "./capabilities";
 
+import { assertManifestMirrorsCapabilities, readExtensionManifest, type ExtensionManifest } from "./manifest";
 installLegacyPiSpecifierShim();
-
+type LoadedExtensionModule =
+	| ExtensionFactory
+	| {
+			default?: ExtensionFactory;
+			capabilities?: unknown;
+			manifest?: unknown;
+	  };
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
-type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
+type SettingsSectionOwner = { readonly token: symbol; readonly extensionPath: string };
+
+/**
+ * Read the capability declaration a module exports alongside its factory.
+ *
+ * Zed carries this in `extension.toml`; an OMP extension is a single module,
+ * so the declaration rides on the module itself. Anything that is not an
+ * array is treated as no declaration at all, which denies everything.
+ */
+function getExtensionCapabilities(module: LoadedExtensionModule): unknown {
+	if (typeof module === "function") return undefined;
+	return module.capabilities;
+}
+
+/**
+ * Read the review manifest a module exports alongside its factory.
+ *
+ * Nothing is executed to obtain it, so a reviewer can read what an extension
+ * claims without running it. A module that exports none simply has no review
+ * identity, which is not an error.
+ */
+function getExtensionManifest(module: LoadedExtensionModule): unknown {
+	if (typeof module === "function") return undefined;
+	return module.manifest;
+}
 
 function getExtensionFactory(module: LoadedExtensionModule): ExtensionFactory | null {
 	const candidate = typeof module === "function" ? module : module.default;
@@ -99,6 +143,7 @@ export class ExtensionRuntimeNotInitializedError extends Error {
  */
 export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
+	settingsSectionOwners = new Map<string, SettingsSectionOwner>();
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
 
 	registerProvider(name: string, config: ProviderConfig, sourceId: string): void {
@@ -139,6 +184,14 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	getCommands(): never {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	getAdvisorStatus(): AdvisorStatus {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	ensureAdvisor(_request: EnsureAdvisorRequest): EnsureAdvisorResult {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -187,6 +240,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		config: ProviderConfig;
 		sourceId: string;
 	}> = [];
+	readonly #settingsOwnerToken = Symbol("extension-settings-owner");
 
 	constructor(
 		public readonly pi: typeof PiCodingAgent,
@@ -194,6 +248,8 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		private readonly runtime: IExtensionRuntime,
 		private readonly cwd: string,
 		public readonly events: EventBus,
+		private readonly settingsInstance: Settings,
+		grants: ResolvedExtensionGrants = resolveExtensionGrants(undefined),
 	) {
 		// Extensions destructure `pi.on` or forward API methods as callbacks, so every
 		// prototype method must keep its receiver when detached. Walk the prototype
@@ -205,6 +261,22 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 			if (typeof descriptor?.value !== "function") continue;
 			Object.defineProperty(this, name, { value: descriptor.value.bind(this), writable: true, configurable: true });
 		}
+
+		// Everything the extension did not declare is refused, including the
+		// `exec` spawn path — a member missing from the declaration is not
+		// reachable, and `process:exec` is re-checked per invocation so a
+		// grant for one command cannot authorise another.
+		const hostExec = (command: string, args: string[], rest: unknown[]) =>
+			execCommand(command, args, (rest[0] as ExecOptions | undefined)?.cwd ?? this.cwd, rest[0] as ExecOptions);
+		applyCapabilityGate(this, EXTENSION_MEMBER_CAPABILITIES, grants, extension.path, {
+			grants,
+			dispatch: hostExec,
+		});
+	}
+
+	get settingsSectionOwners(): Map<string, SettingsSectionOwner> {
+		if (!this.runtime.settingsSectionOwners) this.runtime.settingsSectionOwners = new Map();
+		return this.runtime.settingsSectionOwners;
 	}
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
@@ -229,6 +301,32 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	registerFileDeleteFallback(handler: FileDeleteFallbackHandler): void {
 		this.extension.fileDeleteFallbackHandlers.push(handler);
+	}
+
+	registerSettingsSection<const Fields extends readonly ExtensionSettingField[]>(
+		section: ExtensionSettingsSectionDefinition<Fields>,
+	): ExtensionSettingsSnapshot<Fields> {
+		if (!this.extension.settingsSections) this.extension.settingsSections = new Map();
+		const sections = this.extension.settingsSections;
+		const requestedId = section.id;
+		if (sections.has(requestedId)) {
+			throw new TypeError(
+				`Extension settings section "${requestedId}" is already registered by ${this.extension.path}`,
+			);
+		}
+		const owner = this.settingsSectionOwners.get(requestedId);
+		if (owner && owner.token !== this.#settingsOwnerToken) {
+			throw new TypeError(
+				`Extension settings section "${requestedId}" is already registered by ${owner.extensionPath}`,
+			);
+		}
+		const registered = registerExtensionSettingsSection(section, this.settingsInstance, this.extension.path);
+		this.settingsSectionOwners.set(registered.id, {
+			token: this.#settingsOwnerToken,
+			extensionPath: this.extension.path,
+		});
+		sections.set(registered.id, registered);
+		return registered.snapshot as ExtensionSettingsSnapshot<Fields>;
 	}
 
 	registerCommand(
@@ -328,6 +426,14 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.getCommands();
 	}
 
+	getAdvisorStatus(): AdvisorStatus {
+		return this.runtime.getAdvisorStatus();
+	}
+
+	ensureAdvisor(request: EnsureAdvisorRequest): EnsureAdvisorResult {
+		return this.runtime.ensureAdvisor(request);
+	}
+
 	setModel(model: Model): Promise<boolean> {
 		return this.runtime.setModel(model);
 	}
@@ -368,14 +474,17 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.runtime.unregisterProvider(name, this.extension.path);
 	}
 }
-
-/**
- * Create an Extension object with empty collections.
- */
-function createExtension(extensionPath: string, resolvedPath: string): Extension {
+function createExtension(
+	extensionPath: string,
+	resolvedPath: string,
+	grants: ResolvedExtensionGrants,
+	manifest?: ExtensionManifest,
+): Extension {
 	return {
 		path: extensionPath,
 		resolvedPath,
+		grants,
+		...(manifest === undefined ? {} : { manifest }),
 		handlers: new Map(),
 		tools: new Map(),
 		toolRegistrationListeners: new Set(),
@@ -387,13 +496,14 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		settingsSections: new Map(),
 	};
 }
 
 /**
- * Runs an extension factory with provider registration rollback on failure.
- * Restores the complete registration queue when the factory throws because an
- * extension may unregister entries queued by an earlier extension.
+ * Runs an extension factory with registration rollback on failure. Restores
+ * provider queues and reserved settings namespace ownership because a factory
+ * can fail after changing either shared registry.
  */
 async function runExtensionFactory(
 	factory: ExtensionFactory,
@@ -401,6 +511,9 @@ async function runExtensionFactory(
 	runtime: IExtensionRuntime,
 ): Promise<void> {
 	const providerRegistrationCheckpoint = [...runtime.pendingProviderRegistrations];
+	if (!runtime.settingsSectionOwners) runtime.settingsSectionOwners = new Map();
+	const settingsOwners = runtime.settingsSectionOwners;
+	const settingsOwnerCheckpoint = new Map(settingsOwners);
 
 	try {
 		await factory(api);
@@ -410,6 +523,10 @@ async function runExtensionFactory(
 			runtime.pendingProviderRegistrations.length,
 			...providerRegistrationCheckpoint,
 		);
+		settingsOwners.clear();
+		for (const [sectionId, owner] of settingsOwnerCheckpoint) {
+			settingsOwners.set(sectionId, owner);
+		}
 		throw error;
 	}
 }
@@ -429,11 +546,26 @@ async function importExtensionModule(extensionPath: string, cwd: string): Promis
 			};
 		}
 
-		return { path: extensionPath, factory, resolvedPath, error: null };
+		return {
+			path: extensionPath,
+			factory,
+			resolvedPath,
+			error: null,
+			capabilities: getExtensionCapabilities(module),
+			manifest: getExtensionManifest(module),
+		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
 	}
+}
+
+async function resolveSettingsInstance(cwd: string, settingsInstance?: Settings): Promise<Settings> {
+	if (settingsInstance) return settingsInstance;
+	// A live instance for this cwd already is the best scope there is. Loading a
+	// fresh one would register a newer same-cwd instance, which a legacy
+	// `SettingsManager.create(cwd)` then prefers over the session's own.
+	return findScopedSettings(cwd) ?? Settings.loadIsolated({ cwd });
 }
 
 async function bindExtension(
@@ -442,14 +574,34 @@ async function bindExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
+	settingsInstance: Settings,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const factory = imported.factory;
 	if (imported.error !== null || factory === null) {
 		return { extension: null, error: imported.error };
 	}
 	try {
-		const extension = createExtension(extensionPath, imported.resolvedPath);
-		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+		const grants = imported.trusted === true ? fullExtensionGrants() : resolveExtensionGrants(imported.capabilities);
+		// A manifest is validated here rather than at import so a malformed one
+		// is reported as a load error naming the file, not a throw from the
+		// import. The mirror check keeps the review document from lying about
+		// reach, which is the only reason it is worth carrying at all.
+		const manifest = readExtensionManifest(imported.manifest, extensionPath);
+		if (manifest !== undefined) assertManifestMirrorsCapabilities(manifest, imported.capabilities, extensionPath);
+		const extension = createExtension(extensionPath, imported.resolvedPath, grants, manifest);
+		if (grants.unknown.length > 0) {
+			return {
+				extension: null,
+				error: `Extension declares capabilities this runtime does not implement: ${grants.unknown.join(", ")}: ${extensionPath}`,
+			};
+		}
+		if (grants.malformed.length > 0) {
+			return {
+				extension: null,
+				error: `Extension declares capabilities it cannot use: ${grants.malformed.join("; ")}: ${extensionPath}`,
+			};
+		}
+		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus, settingsInstance, grants);
 		await withHostGuard(() => runExtensionFactory(factory, api, runtime));
 
 		return { extension, error: null };
@@ -468,9 +620,14 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 	name = "<inline>",
+	settingsInstance?: Settings,
 ): Promise<Extension> {
-	const extension = createExtension(name, name);
-	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
+	const scopedSettings = await resolveSettingsInstance(cwd, settingsInstance);
+	// An inline factory is host-constructed, not a loaded extension: the caller
+	// already holds everything it passes on, so it is trusted by construction.
+	const trusted = fullExtensionGrants();
+	const extension = createExtension(name, name, trusted);
+	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus, scopedSettings, trusted);
 	await runExtensionFactory(factory, api, runtime);
 	return extension;
 }
@@ -480,17 +637,18 @@ export async function loadExtensionFromFactory(
  *
  * Module import (the dominant cold-start cost — file I/O plus module
  * evaluation) runs concurrently across extensions; factory binding then runs
- * sequentially in the original path order, so registration semantics
- * (last-wins collisions, shared runtime flag defaults) stay deterministic.
+ * sequentially in the original path order, so shared runtime defaults and
+ * collision diagnostics stay deterministic.
  */
 export async function loadExtensions(
 	paths: string[],
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
+	settingsInstance?: Settings,
 ): Promise<LoadExtensionsResult> {
 	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
-	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime);
+	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime, settingsInstance);
 }
 
 /**
@@ -503,13 +661,22 @@ export async function bindPreparedExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime: IExtensionRuntime = new ExtensionRuntime(),
+	settingsInstance?: Settings,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
+	const scopedSettings = await resolveSettingsInstance(cwd, settingsInstance);
 
 	for (const prepared of preparedExtensions) {
-		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
+		const { extension, error } = await bindExtension(
+			prepared.path,
+			prepared,
+			cwd,
+			resolvedEventBus,
+			runtime,
+			scopedSettings,
+		);
 
 		if (error) {
 			errors.push({ path: prepared.path, error });
@@ -517,6 +684,18 @@ export async function bindPreparedExtensions(
 		}
 
 		if (extension) {
+			// A manifest name is the extension's review identity, so two
+			// extensions claiming one name would make that identity
+			// ambiguous. Refuse the later claimant rather than letting load
+			// order decide which one a reviewer thought they were reading.
+			const claimed = extension.manifest;
+			if (claimed !== undefined && extensions.some(other => other.manifest?.name === claimed.name)) {
+				errors.push({
+					path: prepared.path,
+					error: `Extension declares the manifest name "${claimed.name}", already claimed by another loaded extension`,
+				});
+				continue;
+			}
 			extensions.push(extension);
 		}
 	}
@@ -685,7 +864,8 @@ export async function discoverAndLoadExtensions(
 	eventBus?: EventBus,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
+	settingsInstance?: Settings,
 ): Promise<LoadExtensionsResult> {
 	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, options);
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, undefined, settingsInstance);
 }

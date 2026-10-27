@@ -26,7 +26,7 @@ const ENV_KEY = "PI_TEST_SESSION_SCOPED_ENV";
 // Exports the current session id, the way an extension attributes child
 // processes (commit trailers, audit logs) to the session that ran them.
 const SESSION_ENV_EXTENSION = `
-export default function (pi) {
+export const capabilities = [{ kind: "events:subscribe" }]; export default function (pi) {
 	const exportSessionId = (_event, ctx) => {
 		process.env.${ENV_KEY} = ctx.sessionManager.getSessionId();
 	};

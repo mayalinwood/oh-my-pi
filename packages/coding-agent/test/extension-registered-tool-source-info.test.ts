@@ -74,6 +74,7 @@ describe("RegisteredTool sourceInfo (upstream pi compat)", () => {
 		await Bun.write(
 			resolvedPath,
 			`
+				export const capabilities = [{ kind: 'tools:register' }];
 				export default function(api) {
 					api.registerTool({
 						name: "relative_tool",
@@ -107,6 +108,7 @@ describe("RegisteredTool sourceInfo (upstream pi compat)", () => {
 		await Bun.write(
 			resolvedPath,
 			`
+				export const capabilities = [{ kind: 'tools:register' }];
 				export default function(api) {
 					api.registerTool({
 						name: "relative_source_tool",

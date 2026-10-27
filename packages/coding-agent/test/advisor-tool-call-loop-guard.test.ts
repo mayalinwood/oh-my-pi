@@ -76,7 +76,7 @@ describe("advisor tool-call loop guard", () => {
 		advice?: string,
 		adviceSeverity: "nit" | "concern" | "blocker" = "nit",
 		advices?: { note: string; severity: "nit" | "concern" | "blocker" }[],
-	): { advisor: Agent; contexts: Context[]; reviewStarts: Context[] } {
+	): { advisor: Agent; contexts: Context[]; reviewStarts: Context[]; primaryMock: ReturnType<typeof createMockModel> } {
 		const primaryMock = createMockModel({
 			provider: "anthropic",
 			responses: [
@@ -182,7 +182,7 @@ describe("advisor tool-call loop guard", () => {
 		const advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to be active");
 		advisor.setModel(advisorMock);
-		return { advisor, contexts, reviewStarts };
+		return { advisor, contexts, reviewStarts, primaryMock };
 	}
 
 	it("redirects the advisor's own repeated tool call and reaches its next request", async () => {
@@ -492,6 +492,62 @@ describe("advisor tool-call loop guard", () => {
 		expect(delivered).toContain("second update");
 	});
 
+	it("does not hand a replaced advisor's skipped updates to an advisor that is not the same roster entry", async () => {
+		// The carry is keyed by roster slug. A save that renames the advisor builds a
+		// different advisor: it starts a fresh cadence phase at the current cursor,
+		// so the update the old entry skipped is not replayed under the new name.
+		const { reviewStarts } = createAdvisor({ "advisor.syncBacklog": "1" }, 0, {
+			name: "Interval reviewer",
+			reviewInterval: 2,
+		});
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("first update");
+		expect(reviewStarts).toHaveLength(0);
+		expect(
+			session.applyAdvisorConfigs(
+				[{ name: "Renamed reviewer", reviewInterval: 2, instructions: "Check." }],
+				undefined,
+			),
+		).toBe(1);
+
+		await session.prompt("second update");
+		expect(await session.waitForAdvisorCatchup(2_000)).toBe(true);
+		// Fresh phase: the second update is only the renamed advisor's first
+		// eligible one, so no review is due yet and nothing from "first update"
+		// is replayed.
+		expect(reviewStarts).toHaveLength(0);
+	});
+
+	it("stamps a withheld note with the turn its review covered, so the merged batch reports its age", async () => {
+		// Three primary turns, a review every second boundary, catch-up off: the
+		// review that covers turn 2 emits after that boundary while the primary is
+		// still mid-run, so its concern is withheld and only reaches the primary at
+		// the terminal boundary (turn 3). With a waiting catch-up the boundary would
+		// release it into the very next request instead (covered by the "newest
+		// ready note" test), so the stale path needs the asynchronous policy.
+		// The note describes turn 2, so the batch must say it is one turn old
+		// instead of presenting it as the current state of the work.
+		const note = "Concern: the retry loop never backs off.";
+		createAdvisor(
+			{ "advisor.syncBacklog": "off" },
+			0,
+			{ name: "Interval reviewer", reviewInterval: 2 },
+			2,
+			note,
+			"concern",
+		);
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("inspect missing file");
+		expect(await session.waitForAdvisorCatchup(2_000)).toBe(true);
+		const delivered = [...session.agent.state.messages, ...session.yieldQueue.drainLazy().map(build => build())]
+			.flatMap(message => (message?.role === "custom" ? [JSON.stringify(message.content)] : []))
+			.filter(content => content.includes(note));
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]).toContain('turns_ago=\\"1\\"');
+	});
+
 	it("defers agent-end review across tool-loop continuation", async () => {
 		const { contexts } = createAdvisor(
 			{ "advisor.syncBacklog": "1" },
@@ -634,6 +690,49 @@ describe("advisor tool-call loop guard", () => {
 					JSON.stringify(message.content).includes(note),
 			),
 		).toBe(true);
+	});
+
+	it("global strict catch-up releases when the review lands instead of idling to the 30s cap", async () => {
+		// Regression: the boundary parsed `advisor.syncBacklog: strict` with
+		// Number.parseInt (NaN) and capped the wait at 30s, so no waiter was ever
+		// notified by a completed review and every boundary stalled for the full
+		// cap. A strict wait has threshold 1, no deadline, and releases on catch-up.
+		const note = "Strict catch-up must deliver this before prompt() resolves.";
+		createAdvisor({ "advisor.syncBacklog": "strict" }, 0, undefined, 0, note);
+		if (!session) throw new Error("Expected live session");
+
+		const startedAt = Date.now();
+		await session.prompt("one update");
+		expect(Date.now() - startedAt).toBeLessThan(4_000);
+		const delivered = [...session.agent.state.messages, ...session.yieldQueue.drainLazy().map(build => build())];
+		expect(
+			delivered.some(message => message?.role === "custom" && JSON.stringify(message.content).includes(note)),
+		).toBe(true);
+	});
+
+	it("hands the newest ready note to the very next primary request, not one boundary later", async () => {
+		// Regression (off-by-one): a continuing boundary flushed the backlog BEFORE
+		// its own review ran, so the note that review produced while the strict
+		// catch-up wait was parked stayed withheld until the NEXT boundary. The
+		// primary then always lacked the freshest ready note ("up to the second to
+		// last"). The wait now ends with a second release, so the note rides into
+		// the request that follows the boundary it was reviewed at.
+		const note = "The freshest ready note must reach the next primary request.";
+		const { primaryMock } = createAdvisor({ "advisor.syncBacklog": "strict" }, 0, undefined, 2, note, "concern");
+		if (!session) throw new Error("Expected live session");
+
+		await session.prompt("inspect two missing files");
+		// Two tool steps, so the primary makes three requests. The note is the
+		// product of the review that ran at boundary 1; it must already sit in the
+		// context of request 2, i.e. after exactly ONE assistant message. One
+		// boundary late it would follow two.
+		const messages = session.agent.state.messages;
+		const noteIndex = messages.findIndex(
+			message => message.role === "custom" && JSON.stringify(message.content).includes(note),
+		);
+		expect(noteIndex).toBeGreaterThan(-1);
+		expect(messages.slice(0, noteIndex).filter(message => message.role === "assistant")).toHaveLength(1);
+		expect(primaryMock.calls.length).toBeGreaterThanOrEqual(3);
 	});
 
 	it("resolves catch-up per advisor: a strict final reviewer waits while an off override never parks the boundary", async () => {

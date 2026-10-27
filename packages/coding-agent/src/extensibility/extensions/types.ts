@@ -39,6 +39,12 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type {
+	ExtensionSettingField,
+	ExtensionSettingsSectionDefinition,
+	ExtensionSettingsSnapshot,
+	RegisteredExtensionSettingsSection,
+} from "@oh-my-pi/pi-tui/overlays/extension-settings-types";
+import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -69,6 +75,7 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
+import type { AdvisorStatus, EnsureAdvisorRequest, EnsureAdvisorResult } from "../../advisor/control";
 import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type { CodeReviewAnnotation, TextReviewAnnotation } from "@oh-my-pi/pi-tui/overlays/annotation-types";
@@ -160,6 +167,8 @@ import type {
 	ExtensionAskDialogResult,
 	ExtensionAskDialogSubmitResult,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+import type { ResolvedExtensionGrants } from "./capabilities";
+import type { ExtensionManifest } from "./manifest";
 export type {
 	ExtensionAskDialogOption,
 	ExtensionAskDialogQuestion,
@@ -1608,6 +1617,29 @@ export interface RegisteredCommand {
 }
 
 // ============================================================================
+// Settings Section Registration
+// ============================================================================
+
+// Section and field contracts live beside the native /settings selector in the
+// TUI package (which consumes them); re-exported so extension authors keep a
+// single import path through the coding-agent surface.
+export type {
+	ExtensionSettingValue,
+	ExtensionSettingProvenance,
+	ExtensionBooleanSettingField,
+	ExtensionIntegerSettingField,
+	ExtensionNumberSettingField,
+	ExtensionEnumSettingField,
+	ExtensionTextSettingField,
+	ExtensionSettingField,
+	ExtensionSettingFieldValue,
+	ExtensionSettingsSnapshot,
+	ExtensionSettingsStatusRow,
+	ExtensionSettingsSectionDefinition,
+	RegisteredExtensionSettingsSection,
+} from "@oh-my-pi/pi-tui/overlays/extension-settings-types";
+
+// ============================================================================
 // Extension API
 // ============================================================================
 
@@ -1787,6 +1819,20 @@ export interface ExtensionAPI {
 	registerFileDeleteFallback(handler: FileDeleteFallbackHandler): void;
 
 	// =========================================================================
+	// Settings Registration
+	// =========================================================================
+
+	/**
+	 * Register one native `/settings` section during extension load and return
+	 * its validated, immutable startup snapshot. Persisted edits are written to
+	 * `extensionSettings.<section-id>.<key>` and require a process restart; they
+	 * never mutate this snapshot.
+	 */
+	registerSettingsSection<const Fields extends readonly ExtensionSettingField[]>(
+		section: ExtensionSettingsSectionDefinition<Fields>,
+	): ExtensionSettingsSnapshot<Fields>;
+
+	// =========================================================================
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
 
@@ -1890,6 +1936,12 @@ export interface ExtensionAPI {
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
+
+	/** Get deterministic, content-free Advisor lifecycle and usage status. */
+	getAdvisorStatus(): AdvisorStatus;
+
+	/** Idempotently enable, disable, or context-refresh Advisor runtimes for this session. */
+	ensureAdvisor(request: EnsureAdvisorRequest): EnsureAdvisorResult;
 
 	/** Set the current model. Returns false if no API key available. */
 	setModel(model: Model): Promise<boolean>;
@@ -2136,6 +2188,8 @@ export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTie
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	/** Reserved settings namespace owners, keyed by unique extension instance rather than diagnostic path. */
+	settingsSectionOwners?: Map<string, { readonly token: symbol; readonly extensionPath: string }>;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
 	/** Queue a provider registration until initialization, then apply it immediately. */
@@ -2154,6 +2208,8 @@ export interface ExtensionActions {
 	getAllTools: GetAllToolsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
+	getAdvisorStatus?: () => AdvisorStatus;
+	ensureAdvisor?: (request: EnsureAdvisorRequest) => EnsureAdvisorResult;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
@@ -2202,6 +2258,8 @@ export interface ExtensionCommandContextActions {
 export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
 	getServiceTiers: GetServiceTiersHandler;
 	setServiceTier: SetServiceTierHandler;
+	getAdvisorStatus: () => AdvisorStatus;
+	ensureAdvisor: (request: EnsureAdvisorRequest) => EnsureAdvisorResult;
 }
 
 /** Loaded extension with all registered items. */
@@ -2222,6 +2280,19 @@ export interface Extension {
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 	/** Set once the extension calls `registerProvider`; providers feed startup model resolution. */
 	registersProviders?: boolean;
+	settingsSections?: Map<string, RegisteredExtensionSettingsSection>;
+	/**
+	 * Capabilities this extension declared, already resolved and validated. An
+	 * extension with no declaration holds none, so the handler context it is
+	 * given exposes no privileged member.
+	 */
+	grants?: ResolvedExtensionGrants;
+	/**
+	 * What this extension published about itself for review. Absent means it
+	 * publishes no review identity, the same default-closed shape as an absent
+	 * capability declaration.
+	 */
+	manifest?: ExtensionManifest;
 }
 
 /**
@@ -2234,6 +2305,22 @@ export interface PreparedExtension {
 	resolvedPath: string;
 	factory: ExtensionFactory | null;
 	error: string | null;
+	/**
+	 * Capabilities the module declared. Absent means no grants at all, so an
+	 * extension that declares nothing reaches no privileged host member.
+	 */
+	capabilities?: unknown;
+	/**
+	 * The raw `manifest` export, validated when the module is bound so a
+	 * malformed manifest surfaces as a load error rather than a throw here.
+	 */
+	manifest?: unknown;
+	/**
+	 * Set when the host constructed this module itself (an inline factory).
+	 * The caller already holds everything it passes on, so rebinding it into a
+	 * child session must not silently drop to deny-all.
+	 */
+	trusted?: boolean;
 }
 
 /** Result of loading extensions. */

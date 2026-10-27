@@ -48,8 +48,10 @@ import {
 	ADVISOR_MAX_BUDGET_PER_UPDATE,
 	ADVISOR_SYNC_BACKLOG_MODES,
 	AdviseTool,
+	type AdvisorAdviceDelivery,
 	type AdvisorAgent,
 	type AdvisorReviewMode,
+	type AdvisorDeferredLoss,
 	AdvisorEmissionGuard,
 	type AdvisorHeldUpdates,
 	AdvisorLoopGuard,
@@ -59,11 +61,15 @@ import {
 	AdvisorRuntime,
 	type AdvisorRuntimeStatus,
 	type AdvisorSeverity,
+	type AdvisorStatus,
+	type AdvisorStatusEntry,
 	type AdvisorSyncBacklog,
 	AdvisorTranscriptRecorder,
 	advisorTranscriptFilename,
 	buildAdvisorQuarantineSourceText,
 	compareAdvisorNotes,
+	type EnsureAdvisorRequest,
+	type EnsureAdvisorResult,
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
 	isAdvisorInterruptImmuneTurnActive,
@@ -342,9 +348,7 @@ interface ActiveAdvisor {
 	syncBacklog: AdvisorSyncBacklog | undefined;
 	/** Eligible updates since the last reset; a review is scheduled at each multiple of the interval. */
 	eligibleUpdates: number;
-	/** Primary-turn count when the latest review was scheduled; the update that
-	 *  runs from it covers work up to this turn. Notes stamped with it so merged
-	 *  deliveries can show how many turns old each review was. */
+	/** Primary turns completed when the review now pending was scheduled; stamped on its notes so a late one reports `turns_ago`. */
 	pendingCoveredTurn: number;
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
@@ -407,6 +411,12 @@ export interface AdvisorCatchupOptions {
 	waitThroughRecovery?: boolean;
 	/** Wait on `strict` advisors without the deadline (top-level headless runs only). */
 	strictWithoutDeadline?: boolean;
+}
+
+interface AdvisorRosterEntry {
+	config: AdvisorConfig;
+	name: string;
+	slug: string;
 }
 
 /** Inputs that configure the advisor roster owned by a session. */
@@ -543,6 +553,7 @@ export interface AdvisorStatusOverviewEntry {
 export class SessionAdvisors {
 	readonly #host: SessionAdvisorsHost;
 	#advisorEnabled: boolean;
+	#advisorControlBaselineEnabled: boolean | undefined;
 	#advisorTools: AgentTool[] | undefined;
 	#advisorCreateGrepTool: SessionAdvisorsOptions["createGrepTool"];
 	#advisorCreateEditTool: SessionAdvisorsOptions["createEditTool"];
@@ -562,12 +573,12 @@ export class SessionAdvisors {
 	#advisorProviderSessionIds = new Map<string, string>();
 	#advisorCosts = new Map<string, number>();
 	/**
-	 * Slugs whose recorded spend ran on an OAuth/subscription model. Kept in
-	 * lockstep with {@link #advisorCosts} so {@link isUsingSubscription} can
-	 * attribute historical advisor spend without rescanning the model catalog
-	 * once the advisor runtime is gone (#10131).
+	 * Slugs whose recorded spend ran on an OAuth/subscription model.
 	 */
 	#advisorSubscriptionSlugs = new Set<string>();
+	#advisorControlOverrides = new Map<string, boolean>();
+	#advisorControlResults = new Map<string, EnsureAdvisorResult>();
+	#advisorGeneration = 0;
 	#advisorRecorderClosed: Promise<void> = Promise.resolve();
 	/** Holds recorder writes behind the active resume-cost byte snapshot. */
 	#advisorCostSnapshotBarrier: Promise<void> | undefined;
@@ -671,6 +682,25 @@ export class SessionAdvisors {
 			let scheduledAdvisors: ActiveAdvisor[] | undefined;
 			for (const advisor of this.#advisors) {
 				if (advisor.runtime.disposed) continue;
+				// Every primary boundary owns the deferred flush. Holding the
+				// backlog for the terminal one made a whole run's notes arrive as one
+				// burst describing steps already taken — and, under the terminal
+				// policy, as a visible card no turn consumes. A continuing turn is the
+				// first point where the primary is guaranteed to poll asides again, so
+				// the note is released there, still non-interruptingly. The flush never
+				// resets the per-update budget — no new advisor update starts here.
+				const loss = advisor.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
+				// The bound is a resource limit, so its engagement must be nameable here
+				// and not only on the re-prime path: without this line the peak is
+				// computed, returned and read by nobody, and a boundary that coalesced a
+				// whole run's backlog leaves no operator-visible trace of the drop.
+				if (loss.dropped > 0) {
+					logger.info("advisor notes destroyed by the withheld backlog bound at a primary boundary", {
+						advisor: advisor.name,
+						dropped: loss.dropped,
+						peak: loss.peak,
+					});
+				}
 				// Every advisor captures this boundary's delta now, while it matches
 				// what the primary saw: the per-turn prune that runs right after this
 				// callback may elide its tool results before a later review renders
@@ -692,7 +722,6 @@ export class SessionAdvisors {
 					logger.warn("advisor onTurnEnd threw; delta dropped", { advisor: advisor.name, err: String(error) });
 				}
 			}
-			if (!scheduledAdvisors) return;
 			// Catch-up policy resolves per advisor at each boundary: a roster
 			// entry's `syncBacklog` override wins; omitted entries follow the
 			// global `advisor.syncBacklog` setting live (a settings change needs
@@ -700,17 +729,63 @@ export class SessionAdvisors {
 			// are waited on, each under its own policy — a `strict` final reviewer
 			// blocks the boundary (no wall-clock cap; abort, failure, quota,
 			// transition, and disposal still release it) while an asynchronous
-			// turn reviewer never parks the primary.
-			const globalSyncBacklog = cfgAdvisorSyncBacklog.get(this.#host.settings);
-			const waits: Promise<boolean>[] = [];
-			for (const scheduled of scheduledAdvisors) {
-				const syncBacklog = scheduled.syncBacklog ?? globalSyncBacklog;
-				if (syncBacklog === "off") continue;
-				const strict = syncBacklog === "strict";
-				const threshold = strict ? 1 : Number.parseInt(syncBacklog, 10);
-				waits.push(scheduled.runtime.waitForCatchup(strict ? undefined : 30_000, threshold, signal));
+			// turn reviewer never parks the primary. The terminal sweep below must
+			// still run when no review was scheduled, so this is a guarded block
+			// and not an early return.
+			if (scheduledAdvisors) {
+				const globalSyncBacklog = cfgAdvisorSyncBacklog.get(this.#host.settings);
+				const waits: Promise<void>[] = [];
+				for (const scheduled of scheduledAdvisors) {
+					const syncBacklog = scheduled.syncBacklog ?? globalSyncBacklog;
+					if (syncBacklog === "off") continue;
+					const strict = syncBacklog === "strict";
+					const threshold = strict ? 1 : Number.parseInt(syncBacklog, 10);
+					waits.push(
+						scheduled.runtime.waitForCatchup(strict ? undefined : 30_000, threshold, signal).then(caughtUp => {
+							// The flush at the top of this callback ran BEFORE this boundary's
+							// own review, so a note that review emitted while we waited is
+							// still withheld (the update reviews a turn the primary is
+							// continuing). Left there it would ship one boundary late and the
+							// primary would always lack the newest ready note — delivery
+							// trailed review by exactly one step. Release it now, so it rides
+							// into the very next request. Only when the review actually
+							// landed: a deadline/abort/failure release leaves the review
+							// running, and re-arming its in-progress deferral is not ours to
+							// undo.
+							if (!caughtUp || scheduled.runtime.disposed) return;
+							const lateLoss = scheduled.adviseTool.flushDeferredNotes(terminalBoundary ? "terminal" : "continuation");
+							if (lateLoss.dropped > 0) {
+								logger.info("advisor notes destroyed by the withheld backlog bound at a primary boundary", {
+									advisor: scheduled.name,
+									dropped: lateLoss.dropped,
+									peak: lateLoss.peak,
+								});
+							}
+						}),
+					);
+				}
+				await Promise.all(waits);
 			}
-			await Promise.all(waits);
+			if (!terminalBoundary) return;
+			// A note released at a continuing boundary assumes the primary polls
+			// asides again. The advisor queue is registered `skipIdleFlush`, so that
+			// assumption is the ONLY thing standing between the note and a session
+			// that goes idle still owing it: an idle queue is never drained, and the
+			// entry would wait for an arbitrary later prompt. A terminal release
+			// already owns this case by resolving to a visible card, so a note
+			// released early and stranded by the run ending gets the same treatment
+			// here. Doing it after the catch-up matters — a late review can enqueue
+			// asides of its own, and those are stranded by the same idle drain.
+			// Only once the loop has actually stopped. A terminal boundary can be
+			// reached while the primary is still streaming — the run unwinds there
+			// before it truly ends — and its next `drainLazy` is exactly what
+			// delivers a still-queued aside. Draining the queue into a static card
+			// there steals the note from a live run: it is delivered, but as a
+			// preserved card, so it never steers and the run it belonged to ends
+			// one boundary early.
+			if (!this.#host.agent.state.isStreaming) {
+				this.#preserveStrandedNotes(this.#collectStrandedNotes());
+			}
 		} finally {
 			this.#advisorTerminalBoundaryOpen = false;
 			// Window closed: deliver everything buffered during flush + catch-up
@@ -807,6 +882,24 @@ export class SessionAdvisors {
 	/** Re-primes advisor transcript views across a conversation boundary. */
 	resetSessionState(options: { preserveCost?: boolean } = {}): void {
 		this.#resetAdvisorSessionState(options.preserveCost === true);
+	}
+
+	/** Clear conversation-local lifecycle controls while preserving a forked conversation transcript. */
+	resetLifecycleControlsForFork(): void {
+		this.#advisorControlResults.clear();
+		this.#advisorGeneration++;
+		if (this.#advisorControlOverrides.size === 0) {
+			this.#advisorControlBaselineEnabled = undefined;
+			return;
+		}
+		const baselineEnabled = this.#advisorControlBaselineEnabled ?? this.#advisorEnabled;
+		this.#stopAdvisorRuntime();
+		this.#advisorControlOverrides.clear();
+		this.#advisorEnabled = baselineEnabled;
+		this.#advisorControlBaselineEnabled = undefined;
+		this.#buildAdvisorRuntime(true);
+		this.#resetAdvisorDeliveryLatches();
+		this.#clearAdvisorDeliveryState();
 	}
 
 	/** Drop the recorded spend once a conversation boundary has committed. */
@@ -1061,9 +1154,25 @@ export class SessionAdvisors {
 			this.#advisorCosts.clear();
 			this.#advisorSubscriptionSlugs.clear();
 		}
+		this.#advisorControlResults.clear();
+		this.#advisorGeneration++;
+		// Lifecycle overrides are conversation-local policy; rebuild runtimes after detaching the old ones.
+		if (this.#advisorControlOverrides.size > 0) {
+			const baselineEnabled = this.#advisorControlBaselineEnabled ?? this.#advisorEnabled;
+			this.#stopAdvisorRuntime();
+			this.#advisorControlOverrides.clear();
+			this.#advisorEnabled = baselineEnabled;
+			this.#advisorControlBaselineEnabled = undefined;
+			this.#buildAdvisorRuntime(true);
+			this.#resetAdvisorDeliveryLatches();
+			this.#clearAdvisorDeliveryState();
+			return;
+		}
+		this.#advisorControlBaselineEnabled = undefined;
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
+		const stranded: { advisor: ActiveAdvisor; loss: AdvisorDeferredLoss }[] = [];
 		for (const a of this.#advisors) {
 			a.agentUnsubscribe?.();
 			a.agentUnsubscribe = undefined;
@@ -1072,11 +1181,36 @@ export class SessionAdvisors {
 			// conversation starts with a fresh retry allowance (issue #11947).
 			a.providerWaitRetries = 0;
 			this.#releaseRefusalPin(a);
-			// Resets the emission guard and every tool-side note state together.
-			a.adviseTool.resetDeliveredNotes();
+			// Resets the emission guard and every tool-side note state together. The
+			// return value is what the re-prime destroyed: notes the primary was
+			// still owed, and the count the backlog bound dropped. Collect it here
+			// and route it below — the advisory above is explicit that these
+			// deliveries must not inject into the new conversation, and advice the
+			// primary was already told was queued is not one of them.
+			stranded.push({ advisor: a, loss: a.adviseTool.resetDeliveredNotes() });
 			a.eligibleUpdates = 0;
 			this.#attachAdvisorRecorderFeed(a);
 		}
+		this.#resetAdvisorDeliveryLatches();
+		this.#clearAdvisorDeliveryState();
+		// Routed after the delivery state is cleared, mirroring the extension
+		// context-refresh path: the tool has already coalesced this into at most
+		// one card, so a deep backlog costs the new conversation a single
+		// summary rather than a burst, and the destruction is named in it.
+		for (const { advisor, loss } of stranded) {
+			if (loss.dropped > 0) {
+				logger.info("advisor notes destroyed by the withheld backlog bound across a conversation re-prime", {
+					advisor: advisor.name,
+					dropped: loss.dropped,
+				});
+			}
+			for (const pending of loss.notes) {
+				this.#routeAdvice(advisor, pending.note, pending.severity);
+			}
+		}
+	}
+
+	#resetAdvisorDeliveryLatches(): void {
 		this.#advisorPrimaryTurnsCompleted = 0;
 		this.#advisorPrimaryWillContinue = false;
 		this.#advisorContinuation = undefined;
@@ -1084,17 +1218,20 @@ export class SessionAdvisors {
 		this.#advisorAutoResumeSuppressed = false;
 		this.#advisorBoundaryNotes = [];
 		this.#advisorBoundaryGuidanceLastTurn = undefined;
+	}
+
+	#clearAdvisorDeliveryState(): void {
 		this.#host.yieldQueue.clear("advisor");
 		this.#host.extractQueuedAdvisorCards();
 		this.#host.dropPendingAdvisorCards();
 	}
 
-	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {
+	#advisorRoster(): AdvisorRosterEntry[] {
 		const legacy = !this.#advisorConfigs?.length;
-		const roster: AdvisorConfig[] = legacy ? [{ name: "default" }] : this.#advisorConfigs!;
-		const descriptors: AdvisorRuntimeDescriptor[] = [];
+		const configs: AdvisorConfig[] = legacy ? [{ name: "default" }] : this.#advisorConfigs!;
+		const roster: AdvisorRosterEntry[] = [];
 		const usedSlugs = new Set<string>();
-		for (const config of roster) {
+		for (const config of configs) {
 			let slug = legacy ? "" : slugifyAdvisorName(config.name);
 			if (slug) {
 				let candidate = slug;
@@ -1103,12 +1240,30 @@ export class SessionAdvisors {
 				slug = candidate;
 				usedSlugs.add(slug);
 			}
+			roster.push({ config, name: config.name, slug });
+		}
+		return roster;
+	}
+
+	#isAdvisorRosterEntryEnabled(entry: AdvisorRosterEntry): boolean {
+		return this.#advisorControlOverrides.get(entry.slug) ?? entry.config.enabled !== false;
+	}
+
+	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {
+		const roster = this.#advisorRoster();
+		const descriptors: AdvisorRuntimeDescriptor[] = [];
+		for (const { config, slug } of roster) {
 			// Per-advisor toggle: skip disabled advisors but keep them in the
 			// status map so they show `○` rather than disappearing.
-			if (config.enabled === false) {
+			if (!this.#isAdvisorRosterEntryEnabled({ config, name: config.name, slug })) {
 				this.#advisorStatuses.set(slug, { name: config.name, status: "paused" });
 				continue;
 			}
+			// The roster-less default advisor carries no per-entry cadence and
+			// follows the live session settings. Patch 0001 split roster
+			// construction into `#advisorRoster()`, so the flag upstream read from
+			// the combined function is resolved locally here.
+			const legacy = !this.#advisorConfigs?.length;
 			// Roster entries default to every-turn review; the roster-less default
 			// advisor leaves both unset and follows the cadence settings live.
 			const reviewMode: AdvisorReviewMode | undefined = legacy
@@ -1257,12 +1412,24 @@ export class SessionAdvisors {
 	 * updates, so a rebuild never drops turns the cadence skipped.
 	 */
 	#rebuildAdvisorRuntime(emitWarnings = true): boolean {
+		const carried = this.#captureAdvisorCarry();
+		this.#stopAdvisorRuntime();
+		return this.#buildAdvisorRuntime(true, emitWarnings, carried);
+	}
+
+	/**
+	 * Take what each live advisor must hand to its successor: the captured-but-
+	 * unreviewed updates (removed from the predecessor, so they are adopted
+	 * exactly once) and its cadence phase. Every in-place replacement of the
+	 * roster captures this BEFORE {@link #stopAdvisorRuntime}; capturing after it
+	 * finds no advisor to read and the skipped updates are gone.
+	 */
+	#captureAdvisorCarry(): Map<string, AdvisorCarry> {
 		const carried = new Map<string, AdvisorCarry>();
 		for (const advisor of this.#advisors) {
 			carried.set(advisor.slug, { held: advisor.runtime.releaseHeld(), eligibleUpdates: advisor.eligibleUpdates });
 		}
-		this.#stopAdvisorRuntime();
-		return this.#buildAdvisorRuntime(true, emitWarnings, carried);
+		return carried;
 	}
 
 	#buildAdvisorRuntime(
@@ -1312,7 +1479,7 @@ export class SessionAdvisors {
 			// accepted notes and acknowledges truthfully. No separate accept wrapper.
 			const emissionGuard = new AdvisorEmissionGuard({ budgetPerUpdate });
 			const adviseTool = new AdviseTool(
-				(note, severity, turn) => this.#routeAdvice(advisorRef, note, severity, turn),
+				(note, severity, delivery) => this.#routeAdvice(advisorRef, note, severity, delivery),
 				emissionGuard,
 			);
 
@@ -1656,7 +1823,7 @@ export class SessionAdvisors {
 				reviewInterval: descriptor.reviewInterval,
 				syncBacklog: descriptor.syncBacklog,
 				eligibleUpdates: carried?.get(slug)?.eligibleUpdates ?? 0,
-				pendingCoveredTurn: 0,
+				pendingCoveredTurn: this.#advisorPrimaryTurnsCompleted,
 				retryFallbackPendingSuccess: false,
 				providerWaitRetries: 0,
 				signature,
@@ -1715,7 +1882,12 @@ export class SessionAdvisors {
 	 * admission — the note cleared the emission guard inside AdviseTool when it was
 	 * emitted, so a deferred flush replays the backlog without re-filtering.
 	 */
-	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity, turn?: number): void {
+	#routeAdvice(
+		advisor: ActiveAdvisor,
+		note: string,
+		severity?: AdvisorSeverity,
+		delivery?: AdvisorAdviceDelivery,
+	): void {
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
@@ -1733,12 +1905,28 @@ export class SessionAdvisors {
 				note,
 				severity,
 				advisor: source,
-				turn: turn ?? this.#advisorPrimaryTurnsCompleted,
+				// The turn the producing review covered, not the turn the note landed
+				// on: a late review's note is how the merged batch shows its age.
+				turn: delivery?.turn ?? this.#advisorPrimaryTurnsCompleted,
 			});
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		// The live agent model, not the cached `advisor.model`: compaction
+		// promotion and retry fallback retarget `agent.state.model` without
+		// updating that field, and a note must name the model that wrote it.
+		const model = formatModelString(advisor.agent.state.model);
+		const notes: AdvisorNote[] = [{ note, severity, advisor: source, advisorModel: model }];
 		const terminalAnswerNoQueuedWork = this.#hasTerminalTextAnswerWithoutQueuedWork();
+		// A note released from the withheld backlog rides the loop it was withheld
+		// from, but only while that loop is still running: once it has stopped no
+		// step boundary is left to drain an aside, and a continuation would claim a
+		// session the user is about to prompt. It lands as a visible card instead,
+		// which re-enters context on the next primary request.
+		const liveLoop = this.#host.agent.state.isStreaming && !this.#preserveTerminalYieldAdvice;
+		if (delivery?.withheldInLiveRun && severity !== "blocker" && !liveLoop) {
+			this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), false);
+			return;
+		}
 		// A note that lands after the boundary window closed (catch-up off, or a
 		// review slower than its wait) gets exactly what the merged boundary flush
 		// would have granted it. The loop may still report streaming here, and an
@@ -1752,16 +1940,14 @@ export class SessionAdvisors {
 			continueSeverity: cfgAdvisorContinueSeverity.get(this.#host.settings),
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
 			preserveOnly: this.#preserveAdvisorAdvice,
-			// Key on the live agent-core loop, not session `isStreaming` (which also
-			// counts `#promptInFlightCount` during post-turn unwind). Only a running
-			// loop consumes a steer at its next boundary.
-			streaming: this.#host.agent.state.isStreaming && !this.#preserveTerminalYieldAdvice,
+			streaming: liveLoop,
 			aborting: this.#host.abortInProgress(),
 			terminalAnswerNoQueuedWork,
 			interruptImmuneTurnActive: this.#isAdvisorInterruptImmuneTurnActive(),
+			withheldInLiveRun: delivery?.withheldInLiveRun,
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source, advisorModel: model });
 			return;
 		}
 		this.#deliverAdvisorBatch(notes, formatAdvisorBatchContent(notes), channel === "steer");
@@ -1892,7 +2078,44 @@ export class SessionAdvisors {
 		}
 	}
 
+	/**
+	 * Hand advice the primary never received to one visible card. Used when the
+	 * advisor runtime goes away: there is no turn left to ride into, so the
+	 * honest outcome is advice the operator can read, not silence.
+	 */
+	#preserveStrandedNotes(notes: AdvisorNote[]): void {
+		if (notes.length === 0) return;
+		this.#host.preserveAdvisorCard({
+			role: "custom",
+			customType: "advisor",
+			content: formatAdvisorBatchContent(notes),
+			display: true,
+			attribution: "agent",
+			details: { notes } satisfies AdvisorMessageDetails,
+			timestamp: Date.now(),
+		});
+	}
+
+	/** Every note the live advisors still owe the primary: the withheld backlog
+	 *  plus whatever the aside dispatcher is holding, in that order. */
+	#collectStrandedNotes(): AdvisorNote[] {
+		return [
+			...this.#advisors.flatMap(a => {
+				// The tool coalesces: a backlog too deep for one readable turn
+				// leaves as a single summary note carrying its own count, so this
+				// is a summary the primary sees, not a silent subtraction.
+				const advisor = a.slug ? a.name : undefined;
+				return a.adviseTool.takeDeferredNotes().notes.map(note => ({ ...note, advisor }));
+			}),
+			...this.#host.yieldQueue.take<AdvisorNote>("advisor"),
+		];
+	}
+
 	#stopAdvisorRuntime(): void {
+		// Advice the primary never saw must not die with the runtime: collect the
+		// withheld backlog and the queued asides BEFORE the dispatcher is unhooked,
+		// because unregistering rejects every entry still in the queue.
+		const stranded = this.#collectStrandedNotes();
 		// Detach each recorder feed BEFORE aborting its advisor agent: dispose() aborts
 		// the loop, and an abort emits a final `message_end` we must not enqueue against
 		// a closing recorder (it would reopen and resurrect an already-released file).
@@ -1910,6 +2133,7 @@ export class SessionAdvisors {
 		this.#advisors = [];
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
+		this.#preserveStrandedNotes(stranded);
 	}
 
 	#recordAdvisorCost(advisor: ActiveAdvisor, message: AssistantMessage): void {
@@ -2710,6 +2934,293 @@ export class SessionAdvisors {
 		}
 		return true;
 	}
+	/** Return a content-free lifecycle and aggregate usage snapshot for extensions. */
+	getAdvisorStatus(): AdvisorStatus {
+		const previousStatuses = this.#advisorStatuses;
+		this.#advisorStatuses = new Map();
+		try {
+			const roster = this.#advisorRoster();
+			const descriptors = this.#resolveAdvisorRuntimeDescriptors(false);
+			const descriptorBySlug = new Map(descriptors.map(descriptor => [descriptor.slug, descriptor]));
+			const liveBySlug = new Map(this.#advisors.map(advisor => [advisor.slug, advisor]));
+			const status: AdvisorStatusEntry[] = roster.map(entry => {
+				const live = liveBySlug.get(entry.slug);
+				const descriptor = descriptorBySlug.get(entry.slug);
+				const runtimeStatus = live
+					? live.runtime.quotaExhausted
+						? "quota_exhausted"
+						: live.runtime.failureNotified
+							? "error"
+							: "running"
+					: !this.#advisorEnabled || !this.#isAdvisorRosterEntryEnabled(entry)
+						? "paused"
+						: (this.#advisorStatuses.get(entry.slug)?.status ?? "no_model");
+				const model = live?.model ?? descriptor?.model;
+				return {
+					name: entry.name,
+					status: runtimeStatus,
+					active: live !== undefined,
+					...(model ? { model: { provider: model.provider, id: model.id } } : {}),
+					configuredToolNames: [
+						...(entry.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : entry.config.tools),
+					],
+				};
+			});
+			const stats = this.getAdvisorStats();
+			return {
+				generation: this.#advisorGeneration,
+				configured: roster.length > 0,
+				enabled: this.#advisorEnabled,
+				active: this.#advisors.length > 0,
+				advisors: status,
+				tokens: stats.tokens.total,
+				cost: stats.cost,
+			};
+		} finally {
+			this.#advisorStatuses = previousStatuses;
+		}
+	}
+
+	/**
+	 * Idempotently establish an Advisor lifecycle state for an extension.
+	 * Context refreshes reset private runtime state and seed the cursor to the
+	 * current primary transcript without scheduling a primary turn.
+	 */
+	ensureAdvisor(request: EnsureAdvisorRequest): EnsureAdvisorResult {
+		const idempotencyKey = request.idempotencyKey?.trim() ?? "";
+		const previous = idempotencyKey ? this.#advisorControlResults.get(idempotencyKey) : undefined;
+		if (previous) {
+			return {
+				...previous,
+				generation: this.#advisorGeneration,
+				idempotent: true,
+				enabled: this.#advisorEnabled,
+				active: this.#advisors.length > 0,
+				advisors: [...previous.advisors],
+			};
+		}
+
+		const remember = (
+			outcome: EnsureAdvisorResult["outcome"],
+			reason: string,
+			advisors: string[],
+			resetApplied = false,
+		): EnsureAdvisorResult => {
+			const result: EnsureAdvisorResult = {
+				outcome,
+				reason,
+				generation: this.#advisorGeneration,
+				idempotent: false,
+				resetApplied,
+				enabled: this.#advisorEnabled,
+				active: this.#advisors.length > 0,
+				advisors: [...advisors],
+			};
+			if (idempotencyKey) this.#advisorControlResults.set(idempotencyKey, result);
+			return { ...result, advisors: [...result.advisors] };
+		};
+
+		if (!idempotencyKey) return remember("rejected", "idempotencyKey must contain non-whitespace text", []);
+		if (!request.reason?.trim()) return remember("rejected", "reason must contain non-whitespace text", []);
+		if (typeof request.enabled !== "boolean") return remember("rejected", "enabled must be a boolean", []);
+		const resetMode = request.resetMode ?? "none";
+		if (resetMode !== "none" && resetMode !== "context")
+			return remember("rejected", `Unsupported resetMode: ${String(resetMode)}`, []);
+		if (!request.enabled && resetMode === "context")
+			return remember("rejected", 'resetMode "context" requires enabled: true', []);
+
+		const roster = this.#advisorRoster();
+		const requestedName = request.advisor?.trim();
+		if (request.advisor !== undefined && !requestedName)
+			return remember("rejected", "advisor must contain non-whitespace text when provided", []);
+
+		let scope: AdvisorRosterEntry[];
+		if (requestedName) {
+			const normalizedName = requestedName.toLowerCase();
+			const exact = roster.filter(entry => entry.name.toLowerCase() === normalizedName);
+			const matches =
+				exact.length > 0 ? exact : roster.filter(entry => entry.slug === slugifyAdvisorName(requestedName));
+			if (matches.length === 0) return remember("unavailable", `Advisor "${requestedName}" is not configured`, []);
+			if (matches.length > 1)
+				return remember(
+					"rejected",
+					`Advisor scope "${requestedName}" is ambiguous`,
+					matches.map(entry => entry.name),
+				);
+			scope = matches;
+		} else {
+			const activeSlugs =
+				request.enabled && resetMode === "context"
+					? new Set(this.#advisors.map(advisor => advisor.slug))
+					: undefined;
+			const configuredScope = roster.filter(entry => this.#isAdvisorRosterEntryEnabled(entry));
+			const refreshScope =
+				activeSlugs && activeSlugs.size > 0
+					? roster.filter(entry => activeSlugs.has(entry.slug))
+					: request.enabled
+						? configuredScope
+						: roster;
+			if (request.enabled && refreshScope.length === 0) {
+				return remember("unavailable", "No configured advisor is enabled", []);
+			}
+			if (refreshScope.length > 1 && request.allowMultiple !== true) {
+				return remember(
+					"rejected",
+					"Multiple advisors are configured; name one advisor or set allowMultiple: true",
+					refreshScope.map(entry => entry.name),
+				);
+			}
+			scope = refreshScope;
+		}
+		const advisorNames = scope.map(entry => entry.name);
+		const scopedSlugs = new Set(scope.map(entry => entry.slug));
+		const activeOutsideScope = this.#advisors.some(advisor => !scopedSlugs.has(advisor.slug));
+		if (request.enabled && resetMode === "context" && activeOutsideScope) {
+			return remember(
+				"rejected",
+				"Context refresh must cover every active advisor because delivery state is shared",
+				advisorNames,
+			);
+		}
+
+		if (!request.enabled) {
+			const hasEnabledScope =
+				this.#advisorEnabled &&
+				scope.some(
+					entry =>
+						this.#isAdvisorRosterEntryEnabled(entry) ||
+						this.#advisors.some(advisor => advisor.slug === entry.slug),
+				);
+			if (!hasEnabledScope)
+				return remember("unchanged", "Requested advisor scope is already disabled", advisorNames);
+			if (activeOutsideScope) {
+				return remember(
+					"rejected",
+					"Scoped disable cannot replace active advisors outside the requested scope",
+					advisorNames,
+				);
+			}
+
+			this.#advisorControlBaselineEnabled ??= this.#advisorEnabled;
+			for (const entry of scope) this.#advisorControlOverrides.set(entry.slug, false);
+			if (!activeOutsideScope) {
+				this.#advisorEnabled = false;
+			}
+			this.#stopAdvisorRuntime();
+			if (this.#advisorEnabled) this.#buildAdvisorRuntime(true);
+			this.#resetAdvisorDeliveryLatches();
+			this.#clearAdvisorDeliveryState();
+			this.#advisorGeneration++;
+			return remember("disabled", request.reason.trim(), advisorNames);
+		}
+		const scopeAlreadyActive =
+			this.#advisorEnabled &&
+			scope.every(
+				entry =>
+					this.#isAdvisorRosterEntryEnabled(entry) && this.#advisors.some(advisor => advisor.slug === entry.slug),
+			);
+		if (activeOutsideScope && !scopeAlreadyActive) {
+			return remember(
+				"rejected",
+				"Scoped enable cannot replace active advisors outside the requested scope",
+				advisorNames,
+			);
+		}
+
+		const oldBaselineEnabled = this.#advisorControlBaselineEnabled;
+		this.#advisorControlBaselineEnabled ??= this.#advisorEnabled;
+		const oldEnabled = this.#advisorEnabled;
+		const oldOverrides = new Map(this.#advisorControlOverrides);
+		const oldStatuses = new Map(this.#advisorStatuses);
+		const wasEnabled = new Map(scope.map(entry => [entry.slug, this.#isAdvisorRosterEntryEnabled(entry)]));
+		const activeBefore = new Set(this.#advisors.map(advisor => advisor.slug));
+		if (!oldEnabled && requestedName) {
+			for (const entry of roster) this.#advisorControlOverrides.set(entry.slug, false);
+		}
+		for (const entry of scope) this.#advisorControlOverrides.set(entry.slug, true);
+		this.#advisorEnabled = true;
+
+		this.#advisorStatuses.clear();
+		const resolvedSlugs = new Set(this.#resolveAdvisorRuntimeDescriptors(false).map(descriptor => descriptor.slug));
+		const unavailable = scope.filter(entry => !resolvedSlugs.has(entry.slug));
+		if (unavailable.length > 0) {
+			this.#advisorEnabled = oldEnabled;
+			this.#advisorControlOverrides = oldOverrides;
+			this.#advisorStatuses = oldStatuses;
+			this.#advisorControlBaselineEnabled = oldBaselineEnabled;
+			return remember(
+				"unavailable",
+				`No model resolved for ${unavailable.map(entry => `Advisor "${entry.name}"`).join(", ")}`,
+				advisorNames,
+			);
+		}
+
+		const enableChanged = !oldEnabled || scope.some(entry => wasEnabled.get(entry.slug) !== true);
+		const needsRuntime = scope.some(entry => !activeBefore.has(entry.slug));
+		if (enableChanged || needsRuntime) {
+			try {
+				this.#stopAdvisorRuntime();
+				this.#buildAdvisorRuntime(true);
+				if (scope.some(entry => !this.#advisors.some(advisor => advisor.slug === entry.slug))) {
+					throw new Error("requested Advisor runtime remained inactive");
+				}
+			} catch (error) {
+				this.#stopAdvisorRuntime();
+				this.#advisorEnabled = oldEnabled;
+				this.#advisorControlOverrides = oldOverrides;
+				this.#advisorStatuses = oldStatuses;
+				this.#advisorControlBaselineEnabled = oldBaselineEnabled;
+				try {
+					if (oldEnabled) this.#buildAdvisorRuntime(true);
+				} catch (restoreError) {
+					logger.warn("failed to restore advisor runtime after extension control error", {
+						error: String(restoreError),
+					});
+				}
+				return remember("unavailable", `Advisor runtime could not be enabled: ${String(error)}`, advisorNames);
+			}
+			this.#resetAdvisorDeliveryLatches();
+			this.#clearAdvisorDeliveryState();
+			this.#advisorGeneration++;
+			return remember("enabled", request.reason.trim(), advisorNames);
+		}
+
+		if (resetMode === "context") {
+			const count = this.#host.agent.state.messages.length;
+			// The conversation continues across a context refresh, so a note the
+			// emission guard already admitted is still the primary's to receive.
+			// Collect the withheld notes before the tool forgets them and release
+			// them after the delivery state is cleared below — otherwise the reset
+			// drops the very advice it just made current.
+			const released: { advisor: ActiveAdvisor; note: string; severity?: AdvisorSeverity }[] = [];
+			for (const advisor of this.#advisors) {
+				if (!scopedSlugs.has(advisor.slug)) continue;
+				advisor.agentUnsubscribe?.();
+				advisor.agentUnsubscribe = undefined;
+				advisor.runtime.refreshContext(count, "extension-context-refresh");
+				advisor.providerWaitRetries = 0;
+				for (const pending of advisor.adviseTool.takeDeferredNotes().notes) {
+					released.push({ advisor, note: pending.note, severity: pending.severity });
+				}
+				// The tool owns the emission guard and resets its dedupe memory here.
+				advisor.adviseTool.resetDeliveredNotes();
+				this.#attachAdvisorRecorderFeed(advisor);
+			}
+			this.#resetAdvisorDeliveryLatches();
+			this.#clearAdvisorDeliveryState();
+			for (const item of released) {
+				this.#routeAdvice(item.advisor, item.note, item.severity, { withheldInLiveRun: true });
+			}
+			this.#advisorGeneration++;
+			return remember("unchanged", request.reason.trim(), advisorNames, true);
+		}
+
+		if (scope.every(entry => activeBefore.has(entry.slug))) {
+			return remember("unchanged", "Requested advisor scope is already enabled", advisorNames);
+		}
+		return remember("unavailable", "Requested advisor scope has no active runtime", advisorNames);
+	}
+
 	/**
 	 * Enable or disable the advisor for this session. The setting is overridden for the session,
 	 * and the runtime is started or stopped to match.
@@ -2717,14 +3228,25 @@ export class SessionAdvisors {
 	 * @returns true when the advisor is actively running after the call.
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
+		const overridesChanged = this.#advisorControlOverrides.size > 0;
+		const enabledChanged = this.#advisorEnabled !== enabled;
+		this.#advisorControlOverrides.clear();
+		this.#advisorControlBaselineEnabled = undefined;
 		this.#advisorEnabled = enabled;
 		if (enabled) {
-			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) {
-				return this.#rebuildAdvisorRuntime();
+			if (this.#advisors.length > 0 && (overridesChanged || !this.#advisorRuntimeMatchesCurrentConfig())) {
+				this.#stopAdvisorRuntime();
 			}
-			return this.#buildAdvisorRuntime(true);
+			const active = this.#buildAdvisorRuntime(true);
+			if (enabledChanged || overridesChanged) this.#advisorGeneration++;
+			return active;
 		}
 		this.#stopAdvisorRuntime();
+		if (enabledChanged || overridesChanged) {
+			this.#resetAdvisorDeliveryLatches();
+			this.#clearAdvisorDeliveryState();
+			this.#advisorGeneration++;
+		}
 		return false;
 	}
 
@@ -2763,7 +3285,17 @@ export class SessionAdvisors {
 		this.#advisorConfigs = advisors;
 		this.#advisorSharedInstructions = sharedInstructions;
 		this.#advisorSharedMaxNotesPerUpdate = sharedMaxNotesPerUpdate;
-		this.#rebuildAdvisorRuntime();
+		// Saving a roster replaces every runtime, but not the work they owe: an
+		// advisor kept by slug keeps its cadence phase and the updates its cadence
+		// skipped, exactly as an in-place rebuild does. Control-plane state (the
+		// overrides and the generation) is the part a save does reset.
+		const carried = this.#captureAdvisorCarry();
+		this.#stopAdvisorRuntime();
+		this.#advisorControlOverrides.clear();
+		this.#advisorControlBaselineEnabled = undefined;
+		this.#advisorGeneration++;
+		if (!this.#advisorEnabled) return 0;
+		this.#buildAdvisorRuntime(true, true, carried);
 		return this.#advisors.length;
 	}
 

@@ -17,6 +17,14 @@ interface ToolsState {
 	enabledTools: string[];
 }
 
+export const capabilities = [
+	{ kind: "session:append" },
+	{ kind: "session:write" },
+	{ kind: "session:read" },
+	{ kind: "ui:command" },
+	{ kind: "events:subscribe" },
+];
+
 export default function toolsExtension(pi: ExtensionAPI) {
 	// Track enabled tools
 	let enabledTools: Set<string> = new Set();

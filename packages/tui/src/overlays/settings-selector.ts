@@ -5,6 +5,7 @@ import {
 	Container,
 	extractPrintableText,
 	FuzzyCorpus,
+	fuzzyRank,
 	getKeybindings,
 	getSettingItemFilterText,
 	type ImageBudget,
@@ -45,6 +46,7 @@ import { prefsSectionId } from "../components/settings-list";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../thinking";
 import { getTabBarTheme } from "../chrome/shared";
+import type { ExtensionSettingField, RegisteredExtensionSettingsSection } from "./extension-settings-types";
 import { type ComposerPreviewStatusSource, ComposerShapePreview } from "./composer-shape-preview";
 import { getComposerShapeOptions } from "./composer-shape-registry";
 import { bottomBorder, divider, row, topBorder } from "../chrome/overlay-box";
@@ -543,15 +545,22 @@ function settingsSidebarWidth(entries: readonly SettingsDisplayEntry[]): number 
 	return Math.min(22, nameWidth) + 4;
 }
 
-function getSettingsTabs(): Tab[] {
-	return [
-		...SETTING_TABS.map(id => {
-			const meta = TAB_METADATA[id];
-			const icon = theme.symbol(meta.icon);
-			return { id, label: `${icon} ${meta.label}`, short: icon };
-		}),
-		{ id: "plugins", label: `${theme.icon.package} Plugins`, short: theme.icon.package },
-	];
+type SettingsTabId = SettingTab | "extensions" | "plugins";
+type SearchableSettingsTab = Exclude<SettingsTabId, "plugins">;
+const EXTENSIONS_TAB_SHORT = "Ext";
+const PLUGINS_TAB_SHORT = "Plug";
+
+function getSettingsTabs(showExtensions: boolean): Tab[] {
+	const tabs: Tab[] = SETTING_TABS.map(id => {
+		const meta = TAB_METADATA[id];
+		const icon = theme.symbol(meta.icon);
+		return { id, label: `${icon} ${meta.label}`, short: icon };
+	});
+	if (showExtensions) {
+		tabs.push({ id: "extensions", label: `${theme.icon.package} Extensions`, short: EXTENSIONS_TAB_SHORT });
+	}
+	tabs.push({ id: "plugins", label: `${theme.icon.package} Plugins`, short: PLUGINS_TAB_SHORT });
+	return tabs;
 }
 
 /**
@@ -577,6 +586,8 @@ export interface SettingsRuntimeContext {
 	requestRender?: () => void;
 	/** Live status renderer for composer-shape previews (the session's status line). */
 	composerPreviewStatus?: ComposerPreviewStatusSource;
+	/** Sections registered by loaded extensions during startup. */
+	extensionSettingsSections?: readonly RegisteredExtensionSettingsSection[];
 }
 
 /** Status line settings subset for preview */
@@ -622,8 +633,8 @@ export class SettingsSelectorComponent implements Component {
 	#currentList: SettingsList | null = null;
 	#searchList: SettingsList | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
-	#currentTabId: SettingTab | "plugins" = "appearance";
-	#preSearchTabId: SettingTab | "plugins" = "appearance";
+	#currentTabId: SettingsTabId = "appearance";
+	#preSearchTabId: SettingsTabId = "appearance";
 	#searchQuery = "";
 	/** Single-line editor backing the search banner (cursor, word ops, paste). */
 	#searchInput = new Input();
@@ -654,12 +665,12 @@ export class SettingsSelectorComponent implements Component {
 		this.#sidebarWidth = settingsSidebarWidth(context.settings.entries);
 		// No label prefix (the frame title already says Settings) and no
 		// "(tab to cycle)" hint (folded into the footer hint line).
-		const tabs = getSettingsTabs();
+		const tabs = getSettingsTabs(this.#hasExtensionSettings());
 		this.#tabs = tabs;
 		this.#tabBar = new TabBar("", tabs, getTabBarTheme());
 		this.#tabBar.showHint = false;
 		this.#tabBar.onTabChange = () => {
-			const tabId = this.#tabBar.getActiveTab().id as SettingTab | "plugins";
+			const tabId = this.#tabBar.getActiveTab().id as SettingsTabId;
 			if (this.#searchList) {
 				// While searching, tabs act as jump targets into the result list.
 				const firstId = this.#searchFirstMatch.get(tabId);
@@ -688,15 +699,22 @@ export class SettingsSelectorComponent implements Component {
 		build();
 	}
 
-	#switchToTab(tabId: SettingTab | "plugins"): void {
+	#switchToTab(tabId: SettingsTabId): void {
 		this.#currentTabId = tabId;
 		this.#setContent(() => {
 			if (tabId === "plugins") {
 				this.#showPluginsTab();
+			} else if (tabId === "extensions") {
+				this.#showExtensionSettingsTab();
 			} else {
 				this.#showSettingsTab(tabId);
 			}
 		});
+	}
+
+	#selectedItemIsReadOnlyStatus(): boolean {
+		const item = (this.#searchList ?? this.#currentList)?.getSelectedItem();
+		return item?.id.startsWith("extension:") === true && item.id.includes(":status:");
 	}
 
 	#footerHintText(): string {
@@ -704,8 +722,11 @@ export class SettingsSelectorComponent implements Component {
 		const cancel = editorKey("tui.select.cancel");
 		const tab = formatKeyHint("tab");
 		const switchTabs = `${formatKeyHints(["left", "right"])} to switch tabs`;
+		const readOnlyStatus = this.#selectedItemIsReadOnlyStatus();
 		if (this.#searchList) {
-			return `${confirm} to change · ${tab} to jump tabs · ${cancel} to exit search`;
+			return readOnlyStatus
+				? `Read-only live status · ${tab} to jump tabs · ${cancel} to exit search`
+				: `${confirm} to change · ${tab} to jump tabs · ${cancel} to exit search`;
 		}
 		if (this.#currentTabId === "plugins") {
 			return `${tab} to switch tabs · ${cancel} to close`;
@@ -714,7 +735,9 @@ export class SettingsSelectorComponent implements Component {
 			return `${editorKeys("tui.select.up", "tui.select.down")} to jump sections · ${tab}/${confirm} to settings · ${switchTabs} · ${cancel} to close`;
 		}
 		const nav = this.#hasSectionJump ? `${tab} to jump sections · ${switchTabs}` : `${tab} to switch tabs`;
-		return `${confirm}/${formatKeyHint("space")} to change · ${nav} · Type to search · ${cancel} to close`;
+		return readOnlyStatus
+			? `Read-only live status · ${nav} · Type to search · ${cancel} to close`
+			: `${confirm}/${formatKeyHint("space")} to change · ${nav} · Type to search · ${cancel} to close`;
 	}
 
 	/** Single-line search banner: accent icon, editable query with live cursor, right-aligned match count. */
@@ -736,23 +759,57 @@ export class SettingsSelectorComponent implements Component {
 	 * then a footer hint pinned above the bottom border.
 	 */
 	render(width: number): readonly string[] {
-		const height = Math.max(14, process.stdout.rows || 40);
+		const reportedRows = process.stdout.rows;
+		const height =
+			typeof reportedRows === "number" && Number.isFinite(reportedRows) && reportedRows > 0
+				? Math.floor(reportedRows)
+				: 40;
 		const innerWidth = Math.max(1, width - 4);
+		if (this.#currentTabId === "extensions" && this.#currentList && !this.#currentList.hasOpenSubmenu()) {
+			this.#refreshExtensionSettingsItems();
+		}
 
 		const tabLines = this.#tabBar.render(innerWidth);
 		const searching = this.#searchList !== null;
 		const showPreview = !searching && this.#currentTabId === "appearance";
 		const previewLines = showPreview ? ["", theme.fg("muted", "Preview:"), this.#getStatusPreviewString()] : [];
-
-		// Fixed chrome: top border, tabs, divider, [search row], divider, hint, bottom border.
 		const fixedRows = 1 + tabLines.length + 1 + (searching ? 1 : 0) + 1 + 1 + 1;
-		const contentRows = Math.max(7, height - fixedRows - previewLines.length);
-
+		const compact = height < 14 || fixedRows + previewLines.length + 1 > height;
 		const list = this.#searchList ?? this.#currentList;
+
+		if (compact) {
+			const footerRows = height >= 2 ? 1 : 0;
+			const searchRows = searching && height - footerRows >= 2 ? 1 : 0;
+			const tabBudget = Math.max(0, height - footerRows - searchRows - 1);
+			const compactTabLines = tabLines.slice(0, tabBudget);
+			const contentRows = Math.max(1, height - footerRows - searchRows - compactTabLines.length);
+			let contentLines: readonly string[];
+			if (list) {
+				list.setMaxVisible(Math.max(1, contentRows - 4));
+				contentLines = list.render(innerWidth);
+			} else if (this.#pluginComponent) {
+				contentLines = this.#pluginComponent.render(innerWidth);
+			} else {
+				contentLines = [];
+			}
+
+			const out: string[] = [];
+			this.#tabRowStart = 0;
+			this.#tabRowCount = compactTabLines.length;
+			for (const line of compactTabLines) out.push(row(line, width));
+			if (searchRows === 1) out.push(row(this.#renderSearchBanner(innerWidth), width));
+			this.#contentRowStart = out.length;
+			this.#contentRowCount = contentRows;
+			for (let index = 0; index < contentRows; index++) out.push(row(contentLines[index] ?? "", width));
+			if (footerRows === 1) out.push(row(theme.fg("dim", this.#footerHintText()), width));
+			return out;
+		}
+
+		const contentRows = height - fixedRows - previewLines.length;
 		let contentLines: readonly string[];
 		if (list) {
 			// SettingsList pads itself to viewport + blank + 3 description rows.
-			list.setMaxVisible(contentRows - 4);
+			list.setMaxVisible(Math.max(1, contentRows - 4));
 			contentLines = list.render(innerWidth);
 		} else if (this.#pluginComponent) {
 			contentLines = this.#pluginComponent.render(innerWidth);
@@ -764,21 +821,13 @@ export class SettingsSelectorComponent implements Component {
 		out.push(topBorder(width, "Settings"));
 		this.#tabRowStart = out.length;
 		this.#tabRowCount = tabLines.length;
-		for (const line of tabLines) {
-			out.push(row(line, width));
-		}
+		for (const line of tabLines) out.push(row(line, width));
 		out.push(divider(width));
-		if (searching) {
-			out.push(row(this.#renderSearchBanner(innerWidth), width));
-		}
+		if (searching) out.push(row(this.#renderSearchBanner(innerWidth), width));
 		this.#contentRowStart = out.length;
 		this.#contentRowCount = contentRows;
-		for (let i = 0; i < contentRows; i++) {
-			out.push(row(contentLines[i] ?? "", width));
-		}
-		for (const line of previewLines) {
-			out.push(row(line, width));
-		}
+		for (let index = 0; index < contentRows; index++) out.push(row(contentLines[index] ?? "", width));
+		for (const line of previewLines) out.push(row(line, width));
 		out.push(divider(width));
 		out.push(row(theme.fg("dim", this.#footerHintText()), width));
 		out.push(bottomBorder(width));
@@ -817,7 +866,8 @@ export class SettingsSelectorComponent implements Component {
 		const entries = this.#context.settings.entries;
 		const plugins = this.#currentTabId === "plugins" ? this.#pluginComponent : null;
 		const pluginPage = plugins?.prefsPage();
-		const tab = this.#currentTabId === "plugins" ? undefined : this.#currentTabId;
+		const tab =
+			this.#currentTabId === "plugins" || this.#currentTabId === "extensions" ? undefined : this.#currentTabId;
 
 		const pages: TspPrefsProps["pages"][number][] = SETTING_TABS.map(id => {
 			const changed = this.#changedCount(id);
@@ -1123,7 +1173,7 @@ export class SettingsSelectorComponent implements Component {
 		if (this.#searchList) {
 			this.#searchCorpora = null;
 			this.#setSearchQuery(this.#searchQuery);
-		} else if (this.#currentTabId !== "plugins")
+		} else if (this.#currentTabId !== "plugins" && this.#currentTabId !== "extensions")
 			this.#refreshCurrentTabItems(getSettingsForTab(this.#context.settings.entries, this.#currentTabId));
 	}
 
@@ -1331,9 +1381,14 @@ export class SettingsSelectorComponent implements Component {
 		this.#searchQuery = query;
 		this.#changedCounts.clear();
 
-		const counts = new Map<SettingTab, number>();
+		const counts = new Map<SearchableSettingsTab, number>();
 		const items: SettingItem[] = [];
-		const tabResults: { tab: SettingTab; matched: SettingItem[]; bestScore: number; order: number }[] = [];
+		const tabResults: {
+			tab: SearchableSettingsTab;
+			matched: SettingItem[];
+			bestScore: number;
+			order: number;
+		}[] = [];
 		this.#searchFirstMatch.clear();
 		let total = 0;
 		this.#searchCorpora ??= SETTING_TABS.map(tab => {
@@ -1358,13 +1413,29 @@ export class SettingsSelectorComponent implements Component {
 				order,
 			});
 		}
+		if (this.#hasExtensionSettings()) {
+			const candidates = this.#buildExtensionSettingsItems().filter(item => !item.heading);
+			const ranked = fuzzyRank(candidates, query, getSettingItemFilterText);
+			const matched = ranked.map(result => result.item);
+			counts.set("extensions", matched.length);
+			if (matched.length > 0) {
+				total += matched.length;
+				tabResults.push({
+					tab: "extensions",
+					matched,
+					bestScore: ranked[0]?.score ?? 0,
+					order: SETTING_TABS.length,
+				});
+			}
+		}
 
 		tabResults.sort((a, b) => a.bestScore - b.bestScore || a.order - b.order);
 		for (const result of tabResults) {
-			const meta = TAB_METADATA[result.tab];
+			const icon = result.tab === "extensions" ? theme.icon.package : theme.symbol(TAB_METADATA[result.tab].icon);
+			const label = result.tab === "extensions" ? "Extensions" : TAB_METADATA[result.tab].label;
 			items.push({
 				id: `__tab:${result.tab}`,
-				label: `${theme.symbol(meta.icon)} ${meta.label}`,
+				label: `${icon} ${label}`,
 				currentValue: "",
 				heading: true,
 			});
@@ -1391,57 +1462,76 @@ export class SettingsSelectorComponent implements Component {
 		if (!this.#searchList) return;
 		const selected = jumpToSelection ? this.#searchList.getSelectedItem() : undefined;
 		const selectedDef = selected ? getSettingDef(this.#context.settings.entries, selected.id) : undefined;
-		const targetTab: SettingTab | "plugins" = selectedDef?.tab ?? this.#preSearchTabId;
+		const selectedExtensionId = selected?.id.startsWith("extension:") ? selected.id : undefined;
+		const targetTab: SettingsTabId = selectedDef?.tab ?? (selectedExtensionId ? "extensions" : this.#preSearchTabId);
 
 		this.#searchQuery = "";
 		this.#searchCorpora = null;
 		this.#searchFirstMatch.clear();
 		this.#searchMatchCount = 0;
-		this.#tabs = getSettingsTabs();
+		this.#tabs = getSettingsTabs(this.#hasExtensionSettings());
 		this.#tabBar.setTabs(this.#tabs, targetTab);
 		this.#switchToTab(targetTab);
 		if (selectedDef) {
 			this.#currentList?.selectItem(selectedDef.path);
+		} else if (selectedExtensionId) {
+			this.#currentList?.selectItem(selectedExtensionId);
 		}
 	}
 
 	/** Matching tabs first (counts attached), ordered by best result score; the rest stay muted at the end. */
-	#buildSearchTabs(counts: Map<SettingTab, number>, matchedTabOrder: readonly SettingTab[]): Tab[] {
+	#buildSearchTabs(
+		counts: Map<SearchableSettingsTab, number>,
+		matchedTabOrder: readonly SearchableSettingsTab[],
+	): Tab[] {
 		const matched: Tab[] = [];
 		const empty: Tab[] = [];
-		const matchedIds = new Set<SettingTab>(matchedTabOrder);
-		for (const id of matchedTabOrder) {
+		const matchedIds = new Set<SearchableSettingsTab>(matchedTabOrder);
+		const presentation = (id: SearchableSettingsTab) => {
+			if (id === "extensions") {
+				return { icon: theme.icon.package, label: "Extensions", short: EXTENSIONS_TAB_SHORT };
+			}
 			const meta = TAB_METADATA[id];
 			const icon = theme.symbol(meta.icon);
+			return { icon, label: meta.label, short: icon };
+		};
+		for (const id of matchedTabOrder) {
+			const { icon, label, short } = presentation(id);
 			const count = counts.get(id) ?? 0;
 			if (count > 0) {
-				matched.push({ id, label: `${icon} ${meta.label} (${count})`, short: `${icon} ${count}` });
+				matched.push({ id, label: `${icon} ${label} (${count})`, short: `${short} ${count}` });
 			}
 		}
-		for (const id of SETTING_TABS) {
+		const searchableTabs: SearchableSettingsTab[] = [
+			...SETTING_TABS,
+			...(this.#hasExtensionSettings() ? (["extensions"] as const) : []),
+		];
+		for (const id of searchableTabs) {
 			if (matchedIds.has(id)) continue;
-			const meta = TAB_METADATA[id];
-			const icon = theme.symbol(meta.icon);
-			empty.push({ id, label: `${icon} ${meta.label}`, short: icon, muted: true });
+			const { icon, label, short } = presentation(id);
+			empty.push({ id, label: `${icon} ${label}`, short, muted: true });
 		}
 		// Plugins hosts its own UI; it is not part of the schema-backed search.
-		empty.push({
-			id: "plugins",
-			label: `${theme.icon.package} Plugins`,
-			short: theme.icon.package,
-			muted: true,
-		});
+		empty.push({ id: "plugins", label: `${theme.icon.package} Plugins`, short: PLUGINS_TAB_SHORT, muted: true });
 		return [...matched, ...empty];
 	}
 
 	#syncTabBarToSelection(item: SettingItem | undefined): void {
 		if (!this.#searchList || !item) return;
+		if (item.id.startsWith("extension:")) {
+			this.#tabBar.setActiveById("extensions");
+			return;
+		}
 		const def = getSettingDef(this.#context.settings.entries, item.id);
 		if (def) this.#tabBar.setActiveById(def.tab);
 	}
 
 	/** Value-change dispatch for the search result list (any tab's setting). */
 	#onSearchSettingChange(path: string, newValue: string): void {
+		if (path.startsWith("extension:")) {
+			this.#onExtensionSettingChange(path, newValue);
+			return;
+		}
 		const def = getSettingDef(this.#context.settings.entries, path);
 		if (!def) return;
 		if (def.type === "boolean") {
@@ -1801,6 +1891,222 @@ export class SettingsSelectorComponent implements Component {
 		}
 	}
 
+	#hasExtensionSettings(): boolean {
+		return (this.#context.extensionSettingsSections?.length ?? 0) > 0;
+	}
+
+	#extensionSettingTarget(
+		id: string,
+	): { section: RegisteredExtensionSettingsSection; field: ExtensionSettingField } | undefined {
+		const match = /^extension:([^:]+):field:([^:]+)$/.exec(id);
+		if (!match) return undefined;
+		const section = this.#context.extensionSettingsSections?.find(candidate => candidate.id === match[1]);
+		const field = section?.fields.find(candidate => candidate.key === match[2]);
+		return section && field ? { section, field } : undefined;
+	}
+
+	#formatExtensionSettingValue(field: ExtensionSettingField, value: unknown): string {
+		if (field.type === "boolean") return value === true ? "true" : "false";
+		return String(value ?? "");
+	}
+
+	#extensionSettingConstraints(field: ExtensionSettingField): string {
+		if (field.type === "integer" || field.type === "number") {
+			const kind = field.type === "integer" ? "integer" : "finite number";
+			if (field.min !== undefined && field.max !== undefined) {
+				return `Constraint: ${kind} from ${field.min} through ${field.max}, inclusive.`;
+			}
+			if (field.min !== undefined) return `Constraint: ${kind} at least ${field.min}.`;
+			if (field.max !== undefined) return `Constraint: ${kind} at most ${field.max}.`;
+			return `Constraint: ${kind}.`;
+		}
+		if (field.type === "text") {
+			const constraints: string[] = [];
+			if (field.minLength !== undefined && field.maxLength !== undefined) {
+				constraints.push(`${field.minLength} through ${field.maxLength} characters`);
+			} else if (field.minLength !== undefined) {
+				constraints.push(`at least ${field.minLength} characters`);
+			} else if (field.maxLength !== undefined) {
+				constraints.push(`at most ${field.maxLength} characters`);
+			}
+			if (field.pattern !== undefined) constraints.push(`must fully match /${field.pattern}/`);
+			return constraints.length > 0 ? `Constraints: ${constraints.join("; ")}.` : "Constraint: text.";
+		}
+		return "";
+	}
+
+	#parseExtensionSettingInput(field: ExtensionSettingField, input: string): unknown {
+		if (field.type === "text") return input;
+		const value = input.trim();
+		if (field.type === "integer") {
+			if (!/^-?(?:0|[1-9]\d*)$/.test(value)) throw new TypeError(`${field.label} must be an integer`);
+			return Number(value);
+		}
+		if (field.type === "number") {
+			if (!/^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) {
+				throw new TypeError(`${field.label} must be a finite number`);
+			}
+			const parsed = Number(value);
+			if (!Number.isFinite(parsed)) throw new TypeError(`${field.label} must be a finite number`);
+			return parsed;
+		}
+		throw new TypeError(`${field.label} must be selected from its available values`);
+	}
+
+	#createExtensionSettingSubmenu(
+		section: RegisteredExtensionSettingsSection,
+		field: ExtensionSettingField,
+		currentValue: unknown,
+		done: (value?: string) => void,
+	): Component {
+		const constraints = this.#extensionSettingConstraints(field);
+		const description = `${field.description}${constraints ? ` ${constraints}` : ""} Saved changes require an OMP restart and do not alter the running extension.`;
+		if (field.type === "enum") {
+			return createSettingsSelectField(
+				field.label,
+				description,
+				field.values.map(value => ({ value, label: value })),
+				String(currentValue),
+				value => {
+					section.setValue(field.key, value);
+					done(value);
+					this.#afterExtensionSettingChange();
+				},
+				() => done(),
+				undefined,
+				undefined,
+				undefined,
+				this.#context.requestRender,
+			);
+		}
+
+		this.#textInputActive = true;
+		const finish = (value?: string) => {
+			this.#textInputActive = false;
+			done(value);
+		};
+		// Extension fields are constrained (integer/number/enum/text): an empty
+		// submit is validated like any other input, so no clear-to-unset affordance.
+		return new TextFormField({
+			theme: formTheme,
+			label: field.label,
+			description: description || undefined,
+			initialValue: this.#formatExtensionSettingValue(field, currentValue) || undefined,
+			empty: "submit",
+			hint: "  Enter to save · Esc to cancel",
+			onSubmit: input => {
+				const value = this.#parseExtensionSettingInput(field, input);
+				section.setValue(field.key, value);
+				finish(this.#formatExtensionSettingValue(field, value));
+				this.#afterExtensionSettingChange();
+			},
+			onCancel: () => finish(),
+			requestRender: this.#context.requestRender,
+		});
+	}
+
+	#buildExtensionSettingsItems(): SettingItem[] {
+		const items: SettingItem[] = [];
+		for (const section of this.#context.extensionSettingsSections ?? []) {
+			items.push({
+				id: `__heading:extension:${section.id}`,
+				label: section.description ? `${section.label} — ${section.description}` : section.label,
+				currentValue: "",
+				heading: true,
+			});
+
+			let values = section.snapshot;
+			let invalidPersistedValues = false;
+			try {
+				values = section.readValues();
+			} catch {
+				invalidPersistedValues = true;
+			}
+
+			for (const field of section.fields) {
+				const value = values[field.key];
+				const restartRequired = section.isRestartRequired(field.key);
+				const constraints = this.#extensionSettingConstraints(field);
+				const base = {
+					id: `extension:${section.id}:field:${field.key}`,
+					label: field.label,
+					description: `${field.description}${constraints ? ` ${constraints}` : ""} Stored at extensionSettings.${section.id}.${field.key}; restart required after changes.`,
+					currentValue: this.#formatExtensionSettingValue(field, value),
+					changed: !Object.is(value, field.default),
+					warning: invalidPersistedValues
+						? "Persisted values are invalid; the running extension remains on its validated startup snapshot."
+						: restartRequired
+							? "Restart required: the running extension still uses its immutable startup snapshot."
+							: undefined,
+				};
+				if (field.type === "boolean") {
+					items.push({ ...base, values: ["true", "false"] });
+				} else {
+					items.push({
+						...base,
+						submenu: (_current, done) => this.#createExtensionSettingSubmenu(section, field, value, done),
+					});
+				}
+			}
+
+			let statusRows: readonly { label: string; value: string; description?: string }[] = [];
+			try {
+				statusRows = section.getStatus();
+			} catch {
+				statusRows = [
+					{
+						label: "Live status",
+						value: "unavailable",
+						description: "The extension status provider failed; no configuration was changed.",
+					},
+				];
+			}
+			for (let index = 0; index < statusRows.length; index++) {
+				const status = statusRows[index]!;
+				items.push({
+					id: `extension:${section.id}:status:${index}`,
+					label: `${status.label} (read-only)`,
+					currentValue: status.value,
+					description: status.description
+						? `${status.description} Read-only live status; never persisted.`
+						: "Read-only live status; never persisted.",
+				});
+			}
+		}
+		return items;
+	}
+
+	#onExtensionSettingChange(id: string, newValue: string): void {
+		const target = this.#extensionSettingTarget(id);
+		if (target?.field.type !== "boolean") return;
+		target.section.setValue(target.field.key, newValue === "true");
+		this.#afterExtensionSettingChange();
+	}
+
+	#afterExtensionSettingChange(): void {
+		this.#refreshExtensionSettingsItems();
+		if (this.#searchList && this.#searchQuery) this.#setSearchQuery(this.#searchQuery);
+		this.#context.requestRender?.();
+	}
+
+	#showExtensionSettingsTab(): void {
+		const items = this.#buildExtensionSettingsItems();
+		this.#hasSectionJump = (this.#context.extensionSettingsSections?.length ?? 0) >= 2;
+		this.#currentList = new SettingsList(
+			items,
+			10,
+			getSettingsListTheme(),
+			(id, newValue) => this.#onExtensionSettingChange(id, newValue),
+			() => this.#callbacks.onCancel(),
+			{ layout: "flat", typeToSearch: false, hint: "" },
+		);
+	}
+
+	#refreshExtensionSettingsItems(): void {
+		if (this.#currentTabId !== "extensions" || !this.#currentList) return;
+		this.#currentList.setItems(this.#buildExtensionSettingsItems());
+	}
+
 	/**
 	 * Show a settings tab using definitions.
 	 */
@@ -1873,7 +2179,7 @@ export class SettingsSelectorComponent implements Component {
 
 	/** Re-evaluate condition gates against the current settings and refresh the active list. */
 	#refreshCurrentTabItems(defs: SettingDef[]): void {
-		if (this.#currentTabId === "plugins" || !this.#currentList) return;
+		if (this.#currentTabId === "plugins" || this.#currentTabId === "extensions" || !this.#currentList) return;
 		this.#currentList.setItems(this.#buildItemsForDefs(defs));
 	}
 
@@ -1931,6 +2237,12 @@ export class SettingsSelectorComponent implements Component {
 			activeList.handleInput(data);
 			return;
 		}
+		if (
+			this.#selectedItemIsReadOnlyStatus() &&
+			(getKeybindings().matches(data, "tui.select.confirm") || data === "\n" || data === " ")
+		) {
+			return;
+		}
 
 		if (this.#searchList) {
 			this.#handleSearchModeInput(data, this.#searchList);
@@ -1979,6 +2291,12 @@ export class SettingsSelectorComponent implements Component {
 		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
 			// Jump between tabs that have matches (muted tabs are skipped).
 			this.#tabBar.handleInput(data);
+			return;
+		}
+		if (
+			this.#selectedItemIsReadOnlyStatus() &&
+			(kb.matches(data, "tui.select.confirm") || data === "\n" || data === " ")
+		) {
 			return;
 		}
 		// Selection, paging, and activation stay with the result list.

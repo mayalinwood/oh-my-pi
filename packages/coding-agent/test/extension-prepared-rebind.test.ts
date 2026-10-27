@@ -24,9 +24,19 @@ describe("prepared extension rebinding", () => {
 		const extensionPath = path.join(directory, "counter.ts");
 		const counterKey = `__omp_prepared_extension_${crypto.randomUUID().replaceAll("-", "")}`;
 		const bindingsKey = `${counterKey}_bindings`;
+		// Print cwd via Bun, not `pwd`: on Windows Git-for-Windows' pwd.exe reports MSYS paths (`/tmp/...`).
+		// The exec grant is matched per invocation, so it names exactly this command and these arguments.
+		const printCwd = ["-e", "process.stdout.write(process.cwd())"];
 		await Bun.write(
 			extensionPath,
-			`Reflect.set(globalThis, ${JSON.stringify(counterKey)}, Number(Reflect.get(globalThis, ${JSON.stringify(counterKey)}) ?? 0) + 1);\nexport default function counterExtension(api) {\n  const bindings = Reflect.get(globalThis, ${JSON.stringify(bindingsKey)}) ?? [];\n  bindings.push(api);\n  Reflect.set(globalThis, ${JSON.stringify(bindingsKey)}, bindings);\n}\n`,
+			`Reflect.set(globalThis, ${JSON.stringify(counterKey)}, Number(Reflect.get(globalThis, ${JSON.stringify(counterKey)}) ?? 0) + 1);
+export const capabilities = [{ kind: 'events:emit' }, { kind: 'host:sdk' }, { kind: 'process:exec', command: ${JSON.stringify(process.execPath)}, args: ${JSON.stringify(printCwd)} }];
+export default function counterExtension(api) {
+  const bindings = Reflect.get(globalThis, ${JSON.stringify(bindingsKey)}) ?? [];
+  bindings.push(api);
+  Reflect.set(globalThis, ${JSON.stringify(bindingsKey)}, bindings);
+}
+`,
 		);
 
 		const parentEventBus = new EventBus();
@@ -48,8 +58,6 @@ describe("prepared extension rebinding", () => {
 		expect(bindings[0]).not.toBe(bindings[1]);
 		expect(bindings[0]?.events).toBe(parentEventBus);
 		expect(bindings[1]?.events).toBe(childEventBus);
-		// Print cwd via Bun, not `pwd`: on Windows Git-for-Windows' pwd.exe reports MSYS paths (`/tmp/...`).
-		const printCwd = ["-e", "process.stdout.write(process.cwd())"];
 		const [parentPwd, childPwd] = await Promise.all([
 			bindings[0]!.exec(process.execPath, printCwd),
 			bindings[1]!.exec(process.execPath, printCwd),

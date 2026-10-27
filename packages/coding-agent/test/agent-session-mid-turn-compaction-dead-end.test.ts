@@ -73,7 +73,10 @@ describe("AgentSession mid-turn compaction dead-end", () => {
 			const extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
 			fs.mkdirSync(extensionsDir, { recursive: true });
 			const extensionPath = path.join(extensionsDir, "compaction-short-circuit.ts");
-			const extensionLines = ["export default function(pi) {"];
+			const extensionLines = [
+				"export const capabilities = [{ kind: 'events:subscribe' }];",
+				"export default function(pi) {",
+			];
 			if (options.delayMessageEndPersistence) {
 				extensionLines.push('\tpi.on("message_end", async () => {', "\t\tawait Promise.resolve();", "\t});");
 			}

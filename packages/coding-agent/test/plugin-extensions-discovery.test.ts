@@ -66,7 +66,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(pluginDir, "dist", "extension.ts"),
 			`
-				export default function(pi) {
+				export const capabilities = [{ kind: "ui:command" }]; export default function(pi) {
 					pi.registerCommand("plugin-ext", { handler: async () => {} });
 				}
 			`,
@@ -102,7 +102,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			extensionPath,
 			`
-				export default function(pi) {
+				export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 					const onAny = pi.on;
 					onAny("auto_compaction_start", () => {});
 				}
@@ -156,7 +156,7 @@ describe("plugin extension discovery", () => {
 				'if (legacyExtensions !== modernExtensions) throw new Error("legacy extension import did not remap");',
 				'if (typeof nodePath.join !== "function") throw new Error("node builtin import did not resolve");',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'tools:register' }]; export default function(pi) {",
 				"\tconst { Type } = pi.typebox;",
 				"\tpi.registerTool({",
 				'\t\tname: "legacy-pi-ext",',
@@ -213,7 +213,7 @@ describe("plugin extension discovery", () => {
 			[
 				'import { commandName } from "#src/feature/command";',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				"\tpi.registerCommand(commandName, { handler: async () => {} });",
 				"}",
 			].join("\n"),
@@ -276,7 +276,7 @@ describe("plugin extension discovery", () => {
 			[
 				'import { commandName } from "#src/command";',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				"\tpi.registerCommand(commandName, { handler: async () => {} });",
 				"}",
 			].join("\n"),
@@ -334,7 +334,7 @@ describe("plugin extension discovery", () => {
 			[
 				'import schema from "#schema" with { type: "json" };',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				"\tpi.registerCommand(schema.commandName, { handler: async () => {} });",
 				"}",
 			].join("\n"),
@@ -384,7 +384,7 @@ describe("plugin extension discovery", () => {
 			[
 				'import { commandName } from "#src/internal";',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				"\tpi.registerCommand(commandName, { handler: async () => {} });",
 				"}",
 			].join("\n"),
@@ -436,7 +436,7 @@ describe("plugin extension discovery", () => {
 			[
 				'import { commandName } from "#blocked";',
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				"\tpi.registerCommand(commandName, { handler: async () => {} });",
 				"}",
 			].join("\n"),
@@ -491,7 +491,7 @@ describe("plugin extension discovery", () => {
 				"",
 				"declare global { var __sideEffectMarker: { ok: boolean; runs: number } | undefined; }",
 				"",
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tif (!globalThis.__sideEffectMarker?.ok) throw new Error("register side-effect did not run");',
 				'\tpi.registerCommand("side-effect-ext", { handler: async () => {} });',
 				"}",
@@ -560,7 +560,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			extensionPath,
 			[
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("dir-entry-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),
@@ -607,7 +607,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			extensionPath,
 			[
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("subdir-entry-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),
@@ -656,7 +656,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			realEntry,
 			[
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("nested-manifest-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),
@@ -664,7 +664,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(featureDir, "index.ts"),
 			[
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("decoy-index-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),
@@ -714,7 +714,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(featureDir, "index.ts"),
 			[
-				"export default function(pi) {",
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
 				'\tpi.registerCommand("decoy-index-ext", { handler: async () => {} });',
 				"}",
 			].join("\n"),
@@ -753,9 +753,11 @@ describe("plugin extension discovery", () => {
 		);
 		fs.writeFileSync(
 			moduleEntry,
-			["export default function(pi) {", '\tpi.registerCommand("dts-ext", { handler: async () => {} });', "}"].join(
-				"\n",
-			),
+			[
+				"export const capabilities = [{ kind: 'ui:command' }]; export default function(pi) {",
+				'\tpi.registerCommand("dts-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
 		);
 		// A sibling declaration file must be ignored — importing it would fail.
 		fs.writeFileSync(path.join(extensionsDir, "ext.d.ts"), "export default function (pi: unknown): void;\n");

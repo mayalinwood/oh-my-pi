@@ -40,12 +40,14 @@ describe("extensions discovery", () => {
 	};
 
 	const extensionCode = `
+		export const capabilities = [{ kind: 'ui:command' }];
 		export default function(pi) {
 			pi.registerCommand("test", { handler: async () => {} });
 		}
 	`;
 
 	const extensionCodeWithTool = (toolName: string) => `
+		export const capabilities = [{ kind: 'tools:register' }];
 		export default function(pi) {
 			const { Type } = pi.typebox;
 			pi.registerTool({
@@ -577,6 +579,7 @@ describe("extensions discovery", () => {
 			path.join(extDir, "index.ts"),
 			`			import parseDuration from "local-duration-parser";
 
+				export const capabilities = [{ kind: 'tools:register' }];
 				export default function (pi) {
 					const { Type } = pi.typebox;
 					pi.registerTool({
@@ -617,6 +620,7 @@ describe("extensions discovery", () => {
 
 	it("registers message renderers", async () => {
 		const extCode = `
+			export const capabilities = [{ kind: 'ui:message-renderer' }];
 			export default function(pi) {
 				pi.registerMessageRenderer("my-custom-type", (message, options, theme) => {
 					return null; // Use default rendering
@@ -669,6 +673,7 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(
 			hookPath,
 			`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ block: true, reason: "blocked by hook" }));
 				}
@@ -688,7 +693,7 @@ describe("extensions discovery", () => {
 		const hookPath = path.join(hookDir, "models-poison.ts");
 		fs.writeFileSync(
 			hookPath,
-			`export default function(pi) {
+			`export const capabilities = [{ kind: "events:subscribe" }]; export default function(pi) {
 				pi.on("tool_call", async () => ({ block: true, reason: "blocked by hook" }));
 			}`,
 		);
@@ -714,6 +719,7 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(
 			hookPath,
 			`
+				export const capabilities = [{ kind: 'events:subscribe' }];
 				export default function(pi) {
 					pi.on("tool_call", async () => ({ block: true, reason: "blocked by hook" }));
 				}

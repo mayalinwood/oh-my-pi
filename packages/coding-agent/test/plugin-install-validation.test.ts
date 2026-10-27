@@ -107,7 +107,7 @@ describe("PluginManager.install load validation", () => {
 				await writePluginPackage(pluginsNodeModules, "pi-figma-remote-auth", {
 					version: "1.2.3",
 					source:
-						'export default function(pi) { pi.registerCommand("figma-auth", { handler: async () => {} }); }\n',
+						'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("figma-auth", { handler: async () => {} }); }\n',
 				});
 			})();
 
@@ -167,7 +167,8 @@ describe("PluginManager.install load validation", () => {
 		const name = "@scope/plugin";
 		await writePluginPackage(pluginsNodeModules, name, {
 			version: "1.0.3",
-			source: 'export default function(pi) { pi.registerCommand("scoped", { handler: async () => {} }); }\n',
+			source:
+				'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("scoped", { handler: async () => {} }); }\n',
 		});
 		const packageJson = JSON.stringify({
 			name: "omp-plugins",
@@ -266,7 +267,7 @@ describe("PluginManager.install load validation", () => {
 					version: "1.0.0",
 					peerDependencies: { "missing-peer": "^1.0.0" },
 					source:
-						'import { missing } from "missing-peer";\nexport default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
+						'import { missing } from "missing-peer";\nexport const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
 				});
 			})();
 
@@ -301,7 +302,8 @@ describe("PluginManager.install load validation", () => {
 		);
 		await writePluginPackage(pluginsNodeModules, "broken-plugin", {
 			version: "1.0.0",
-			source: 'export default function(pi) { pi.registerCommand("old-ok", { handler: async () => {} }); }\n',
+			source:
+				'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("old-ok", { handler: async () => {} }); }\n',
 		});
 
 		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
@@ -320,7 +322,7 @@ describe("PluginManager.install load validation", () => {
 					version: "2.0.0",
 					peerDependencies: { "missing-peer": "^1.0.0" },
 					source:
-						'import { missing } from "missing-peer";\nexport default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
+						'import { missing } from "missing-peer";\nexport const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
 				});
 			})();
 
@@ -366,7 +368,8 @@ describe("PluginManager.install load validation", () => {
 		);
 		await writePluginPackage(pluginsNodeModules, "git-plugin", {
 			version: "1.0.0",
-			source: 'export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
+			source:
+				'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
 		});
 
 		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
@@ -386,7 +389,7 @@ describe("PluginManager.install load validation", () => {
 						version: "2.0.0",
 						peerDependencies: { "missing-peer": "^1.0.0" },
 						source:
-							'import { missing } from "missing-peer";\nexport default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
+							'import { missing } from "missing-peer";\nexport const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
 					});
 				})();
 
@@ -454,7 +457,7 @@ describe("PluginManager.install load validation", () => {
 				);
 				await Bun.write(
 					path.join(installedDir, "dist", "valid.ts"),
-					'export default function(pi) { pi.registerCommand("valid-ext", { handler: async () => {} }); }\n',
+					'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("valid-ext", { handler: async () => {} }); }\n',
 				);
 			})();
 
@@ -502,7 +505,8 @@ describe("PluginManager.install load validation", () => {
 		);
 		await writePluginPackage(pluginsNodeModules, "git-plugin", {
 			version: "1.0.0",
-			source: 'export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
+			source:
+				'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
 		});
 
 		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
@@ -523,7 +527,7 @@ describe("PluginManager.install load validation", () => {
 						version: "2.0.0",
 						peerDependencies: { "missing-peer": "^1.0.0" },
 						source:
-							'import { missing } from "missing-peer";\nexport default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
+							'import { missing } from "missing-peer";\nexport const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
 					});
 				})();
 				return {
@@ -581,7 +585,7 @@ describe("PluginManager.install load validation", () => {
 					version: "1.0.0",
 					peerDependencies: { "missing-peer": "^1.0.0" },
 					source:
-						'import { missing } from "missing-peer";\nexport default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
+						'import { missing } from "missing-peer";\nexport const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand(String(missing), { handler: async () => {} }); }\n',
 				});
 			})();
 			return {
@@ -615,7 +619,8 @@ describe("PluginManager.install load validation", () => {
 		await Bun.write(bunLockPath, ORIGINAL_LOCK);
 		await writePluginPackage(pluginsNodeModules, "git-plugin", {
 			version: "1.0.0",
-			source: 'export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
+			source:
+				'export const capabilities = [{ kind: "ui:command" }]; export default function(pi) { pi.registerCommand("git-old-ok", { handler: async () => {} }); }\n',
 		});
 		// The seeded manifest declares one feature `keep`; user will request
 		// the unknown feature `ghost` instead.

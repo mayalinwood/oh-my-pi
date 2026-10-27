@@ -68,6 +68,8 @@ function registerFixtureProvider(api) {
 	});
 }
 
+export const capabilities = [{ kind: "provider:register" }, { kind: "ui:command" }, { kind: "host:sdk" }];
+
 export default function (api) {
 	registerFixtureProvider(api);
 	api.registerCommand("settings-session-smoke", {

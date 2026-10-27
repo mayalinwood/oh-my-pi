@@ -40,6 +40,8 @@ console.log();
 /*
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+export const capabilities = [{ kind: "events:subscribe" }, { kind: "tools:register" }, { kind: "ui:command" }];
+
 export default function (pi: ExtensionAPI) {
 	const z = pi.zod;
 
